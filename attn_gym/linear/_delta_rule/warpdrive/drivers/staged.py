@@ -65,7 +65,7 @@ from .. import (
     kda_prefill,
     kda_recompute,
 )
-from ..kda_common import B_T, TORCH_NAMES
+from ..kda_common import B_T, TORCH_NAMES, operand_dtypes
 from ..ragged import new_tma_slots
 from . import summary
 from .plan import SummaryCost, _num_sm
@@ -350,14 +350,19 @@ def forward_pieces(
     launch: _Launch | None,
     *,
     fastmath: bool,
+    intra_chunk_dtypes: str,
 ) -> ForwardPieces | None:
     """Piece maps of the forward's ``launch`` (:func:`plan`) for packed ``[T, H, D]`` operands
-    (natural-log FP32 channel gate, FP32 beta), None when the staged passes cannot run it."""
+    (natural-log FP32 channel gate, FP32 beta), None when the staged passes cannot run it.
+    ``intra_chunk_dtypes`` is ``chunk_kda``'s."""
     if not _launchable(KDA, launch, q, k, v, gate, beta):
         return None
 
     def summarize(bias: torch.Tensor, transition: torch.Tensor) -> None:
-        summary._forward_summary(k, v, gate, beta, bias, transition, launch, fastmath=fastmath)
+        summary._forward_summary(
+            k, v, gate, beta, bias, transition, launch, fastmath=fastmath,
+            intra_chunk_dtypes=intra_chunk_dtypes,
+        )  # fmt: skip
 
     return _forward_pieces(launch, k, v, cu_seqlens, summarize, fastmath=fastmath)
 
@@ -376,9 +381,10 @@ def forward_from_pieces(
     initial_state: torch.Tensor | None,
     output_final_state: bool,
     fastmath: bool,
+    intra_chunk_dtypes: str,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """The local forward over the pieces: ``(o, final_state)`` from FP32 ``[N, H, V, K]``
-    entry states (zero when None)."""
+    entry states (zero when None). ``intra_chunk_dtypes`` is ``chunk_kda``'s."""
     tokens, heads, dim_k = q.shape
     dim_v = v.shape[-1]
     launch = pieces.launch
@@ -387,6 +393,7 @@ def forward_from_pieces(
     if output_final_state:
         final = _sequence_states(cu_seqlens, heads, dim_v, dim_k, q.device)
     o = torch.empty(tokens, heads, dim_v, dtype=q.dtype, device=q.device)
+    decay, solve = operand_dtypes(TORCH_NAMES[q.dtype], intra_chunk_dtypes)
     op = kda_prefill.KdaPrefill.get_or_build(
         TORCH_NAMES[q.dtype],
         TORCH_NAMES[gate.dtype],
@@ -398,6 +405,8 @@ def forward_from_pieces(
         0,
         _num_sm(q.device),
         fastmath,
+        decay_dtype=decay,
+        solve_dtype=solve,
         beta_dtype=TORCH_NAMES[beta.dtype],
         state_dtype="fp32",
     )
@@ -475,10 +484,13 @@ def backward_pieces(
     scale: float,
     initial_state: torch.Tensor | None,
     fastmath: bool,
+    intra_chunk_dtypes: str,
 ) -> BackwardPieces | None:
     """Reverse maps and checkpoints of the forward's ``launch`` for packed ``[T, H, D]``
     operands from FP32 ``[N, H, V, K]`` entry states (zero when None), None when the staged
-    passes cannot run it (as the forward decided)."""
+    passes cannot run it (as the forward decided). The forward summaries and the checkpoint
+    recompute take the forward's ``intra_chunk_dtypes``, so the checkpoints and transitions are
+    those :func:`forward_pieces` gave the forward."""
     if not _launchable(KDA, launch, q, k, v, gate, beta):
         return None
     assert not requires_int64_abi(d_output)
@@ -488,17 +500,23 @@ def backward_pieces(
     device = k.device
 
     def forward_summary(bias: torch.Tensor, transition: torch.Tensor) -> None:
-        summary._forward_summary(k, v, gate, beta, bias, transition, launch, fastmath=fastmath)
+        summary._forward_summary(
+            k, v, gate, beta, bias, transition, launch, fastmath=fastmath,
+            intra_chunk_dtypes=intra_chunk_dtypes,
+        )  # fmt: skip
 
     def reverse_summary(entry: torch.Tensor) -> None:
         summary._reverse_summary(
             q, k, gate, beta, d_output, cu_seqlens, scale, entry, None, launch, fastmath=fastmath
         )
 
+    decay, solve = operand_dtypes(TORCH_NAMES[k.dtype], intra_chunk_dtypes)
+
     def recompute(states: torch.Tensor, checkpoints: torch.Tensor) -> None:
         op = kda_recompute.KdaRecompute.get_or_build(
             TORCH_NAMES[k.dtype], TORCH_NAMES[gate.dtype], dim_k, dim_v, True, _num_sm(device),
-            fastmath, beta_dtype=TORCH_NAMES[beta.dtype], state_dtype="fp32",
+            fastmath, decay_dtype=decay, solve_dtype=solve,
+            beta_dtype=TORCH_NAMES[beta.dtype], state_dtype="fp32",
         )  # fmt: skip
         kda_recompute.compile_kda_recompute(op)(
             k, v, gate, beta, states, checkpoints, launch.work_items, launch.work_count,

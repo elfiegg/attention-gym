@@ -201,21 +201,27 @@ def test_unsplit_summaries_match_across_fastmath_bitwise(monkeypatch) -> None:
 
 
 PACKAGE = "attn_gym.linear._delta_rule.warpdrive"
+PRECISION = {"decay_dtype": "tf32", "solve_dtype": "fp16"}  # the default operand dtypes
 # (module, class, constructor arguments, compile function, its arguments after the op)
 GATE_KERNELS = [
     (
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "fp32", 128, 128, 1, True, True, 0, 152),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **PRECISION},
     ),
-    ("kda_prep", "KdaPrep", ("bf16", "fp32", 128, 152), {"beta_dtype": "fp32"}),
-    ("kda_summary", "KdaSummary", ("bf16", "fp32", 128, 128, 152), {"beta_dtype": "fp32"}),
+    ("kda_prep", "KdaPrep", ("bf16", "fp32", 128, 152), {"beta_dtype": "fp32", **PRECISION}),
+    (
+        "kda_summary",
+        "KdaSummary",
+        ("bf16", "fp32", 128, 128, 152),
+        {"beta_dtype": "fp32", **PRECISION},
+    ),
     (
         "kda_recompute",
         "KdaRecompute",
         ("bf16", "fp32", 128, 128, True, 152),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **PRECISION},
     ),
     (
         "kda_bprop",
