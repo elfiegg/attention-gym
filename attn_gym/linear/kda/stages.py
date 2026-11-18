@@ -66,6 +66,7 @@ from attn_gym.linear.kda.impl.warpdrive_ops import (
 )
 from attn_gym.linear.kda.validation import (
     resolve_intra_chunk_dtypes,
+    resolve_kda_backend,
     resolve_kernel_options,
     validate_kda_inputs,
 )
@@ -326,12 +327,12 @@ def chunk_kda_prepare(
     dimension must be one so token offsets index one packed span (NOTE [Terminology] in
     ``attn_gym.linear.context_parallel``).
     ``fastmath`` follows ``chunk_kda`` and applies to preparation, summaries, and ``run``.
-    Pass the same value to ``chunk_kda_prepare_backward``.
-    ``kernel_options={"backend": "warpdrive"}`` runs the local pass and both summaries with
-    warpdrive's kernels. Split schedules are not available with entry states. ``"autotune"`` and
-    ``"intra_chunk_dtypes"`` follow ``chunk_kda``; ``"batch_invariant"`` (warpdrive only) keeps
-    each sequence's summary bits independent of the rest of the stream
-    (:class:`attn_gym.linear.types.StageKernelOptions`).
+    Pass the same value to ``chunk_kda_prepare_backward``. ``"backend"`` selects the kernels
+    of the local pass and both summaries as in ``chunk_kda``, so the default runs warpdrive on
+    SM100-family GPUs except for FP16. Split schedules are not available with entry states.
+    ``"autotune"`` and ``"intra_chunk_dtypes"`` follow ``chunk_kda``; ``"batch_invariant"``
+    (explicit ``"warpdrive"`` only) keeps each sequence's summary bits independent of the rest
+    of the stream (:class:`attn_gym.linear.types.StageKernelOptions`).
     """
     options = resolve_kernel_options(kernel_options, op_name="chunk_kda_prepare", staged=True)
     backend, autotune, schedule = options.backend, options.autotune, options.schedule
@@ -348,6 +349,7 @@ def chunk_kda_prepare(
         raise TypeError(
             "chunk_kda_prepare requires q, k, and v to share dtype float16 or bfloat16"
         )
+    backend = resolve_kda_backend(backend, q, k, v)
     if backend == "warpdrive":
         validate_warpdrive_available(q)
         if cu_seqlens is None:
@@ -597,9 +599,9 @@ def chunk_kda_prepare_backward(
     (``"autotune"``), and the warpdrive forward transitions the reverse maps transpose
     (``"intra_chunk_dtypes"``). The tape selects the backend: a warpdrive tape
     (:class:`ChunkKDAWarpdriveSaved`) returns :class:`ChunkKDAWarpdriveBackward`.
-    ``"backend"`` may be omitted; an explicit one must name the tape's backend. A warpdrive tape
-    also fixes the summary plan: the backward runs the forward's pieces whatever its own
-    ``"batch_invariant"``, and ``True`` against a tape whose forward split raises.
+    ``"backend"`` may be omitted or ``"auto"``; ``"fused"`` or ``"warpdrive"`` must name the tape's
+    backend. A warpdrive tape also fixes the summary plan: the backward runs the forward's pieces
+    whatever its own ``"batch_invariant"``, and ``True`` against a tape whose forward split raises.
     """
     d_output, scale = normalize_backward_span(saved.v, saved.q.shape[-1], d_output, scale)
     warpdrive = isinstance(saved, ChunkKDAWarpdriveSaved)
