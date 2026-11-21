@@ -13,13 +13,16 @@ message) with ``start=None`` (device position, the whole cache behind its mask):
                 item), relative-bias scores, flash partial
                 over the split's 64-key blocks; the newest
                 split adds the new token; one item per kv
-                head writes the cache and ring rows
+                head writes the ring rows, publishes the
+                new K/V row
     OPROJ       row tile x quarter of the q heads: merge    -> fp32 partials (tagged)
                 the heads' splits with the sink, sigmoid
                 gate, then 32 o_proj rows x 768 columns;
                 the last quarter's item reduces its 32
                 columns: split-order sum, post-attention
                 conv (ring write), residual               -> fp32 residual
+                (row tile 0's items also store the new
+                K/V rows once their heads' items finished)
 
 Sliding layers read the keys in ``(pos - window, pos]`` with static k/v convolutions; full
 layers read ``[0, pos]`` with dynamic taps and log scaling of the query and relative state
@@ -33,7 +36,8 @@ Roles, tagged words, the weight ring and the epoch follow ``mlp_kernel`` (and
 through one ring, warps 0-7 ``compute`` consume them. The host deals rows round-robin in
 dependency order (QKV, ATTN, OPROJ by split) for ``StaticPersistent``; with every CTA resident
 the earliest unfinished row has its producers finished. The cache row at the position is
-written by one item after its own KV loads; the other items reading its block mask it.
+stored only after every item reading the block that holds it has finished; those items mask
+the row's stale contents.
 """
 
 import math
@@ -120,6 +124,7 @@ class AttnParams:
     attn_o: cute.Tensor  # tagged int64 (q_heads, splits, HEAD_DIM) unnormalized O
     attn_ml: cute.Tensor  # tagged int64 (q_heads, splits, 2) (m in log2 units, l)
     o_part: cute.Tensor  # tagged int64 (O_SPLITS, hidden) o_proj partials
+    kv_new: cute.Tensor  # tagged int64 (2, kv_dim): the new K, then V row of every kv head
     state: cute.Tensor  # int32 (2,): launch epoch, finished CTAs
     pos: cute.Tensor  # int64 (1,) position of the token
     h: cute.Tensor  # (hidden,) bf16 visit input
@@ -209,8 +214,12 @@ class InklingAttnKernel(WarpSpecialized):
             raise ValueError(f"q heads must be a multiple of kv heads and of {O_SPLITS}")
         if q_heads // O_SPLITS > COMPUTE_WARPS or (q_heads // O_SPLITS * HEAD_DIM) % TILE_K:
             raise ValueError("an o_proj split merges one head per warp in whole 256-column tiles")
-        if d_rel % 8 or d_rel > 32 or not 0 < extent <= rel_width:
-            raise ValueError("need d_rel a multiple of 8 up to 32 and extent <= rel_width")
+        if (q_heads // O_SPLITS) % (q_heads // kv_heads):
+            raise ValueError("an o_proj split must cover whole groups of q heads")
+        if d_rel % 8 or d_rel > 32 or not 0 < extent <= min(rel_width, hidden):
+            raise ValueError("need d_rel a multiple of 8 up to 32 and extent <= rel_width, hidden")
+        if full and conv_kernel % 2:
+            raise ValueError("full layers fetch dynamic taps in pairs: need an even kernel")
         if not 2 <= conv_kernel <= RING or not 1 <= splits <= 32:
             raise ValueError("need a kernel-2..RING convolution and 1 to 32 splits")
         if full != (window == 0) or full != (log_floor > 0):
@@ -281,6 +290,7 @@ class InklingAttnKernel(WarpSpecialized):
             "attn_o": self.q_heads * self.splits * HEAD_DIM,
             "attn_ml": self.q_heads * self.splits * 2,
             "o_part": O_SPLITS * self.hidden,
+            "kv_new": 2 * self.kv_dim,
         }
 
     @property
@@ -382,6 +392,8 @@ class InklingAttnKernel(WarpSpecialized):
                         hq = b * self.heads_per_split + warp
                         self.merge_head(p, hq, warp, obuf, epoch, lane)
                     self.csync.sync()
+                if a == 0:
+                    self.store_kv_rows(p, b, pos, epoch, tid)
                 vals, row, chans = self.engine.tile(
                     p, (w,), (), obuf, self.oproj_k_tiles, warp, lane
                 )
@@ -799,13 +811,13 @@ class InklingAttnKernel(WarpSpecialized):
                             pr = pr0 if i == 0 else pr1
                             for e in cutlass.range_constexpr(16):
                                 o[e] = o[e] + pr * vv[e]
-        # The writer stores the new K/V row after its own loads of the block holding it
-        # completed; the other items reading that block mask it (scores select -inf, values
-        # are skipped), so their racing reads never matter.
+        # The new K/V row goes to the cache only after every item reading the block that holds
+        # its position finished (``store_kv_rows``): the writer publishes it.
         if writer & (tid < HEAD_DIM):
-            row = kvh * (p.k_cache.shape[0] // self.kv_heads) + pos
-            p.k_cache[row, tid] = BFloat16(p.qkvs[HEAD_DIM + tid])
-            p.v_cache[row, tid] = BFloat16(p.qkvs[2 * HEAD_DIM + tid])
+            publish(p.kv_new, kvh * HEAD_DIM + tid, p.qkvs[HEAD_DIM + tid], epoch)
+            publish(
+                p.kv_new, self.kv_dim + kvh * HEAD_DIM + tid, p.qkvs[2 * HEAD_DIM + tid], epoch
+            )
         # Merge the four lane groups (they share m), then publish this warp's state to ATT.
         lsum = lsum + cute.arch.shuffle_sync_bfly(lsum, offset=8)
         lsum = lsum + cute.arch.shuffle_sync_bfly(lsum, offset=16)
@@ -878,6 +890,25 @@ class InklingAttnKernel(WarpSpecialized):
         if tid == 0:
             publish(p.attn_ml, 2 * item, Float32(-1e30), epoch)
             publish(p.attn_ml, 2 * item + 1, Float32(0.0), epoch)
+
+    @cute.jit
+    def store_kv_rows(self, p: AttnParams, split, pos, epoch, tid):
+        """Cache rows ``pos`` of the kv heads whose q heads o_proj split ``split`` covers, from
+        their writers' published K/V, by row tile 0's item of the split after its merge: every
+        ATTN item of those heads has then published its partial, after its last KV load, so no
+        TMA read of the block holding ``pos`` is in flight."""
+        heads = self.heads_per_split // self.group
+        max_len = p.k_cache.shape[0] // self.kv_heads
+        for i in cutlass.range_constexpr(-(-heads * HEAD_DIM // COMPUTE_THREADS)):
+            index = i * COMPUTE_THREADS + tid
+            if index < heads * HEAD_DIM:
+                kvh = split * heads + index // HEAD_DIM
+                d = index % HEAD_DIM
+                vals = cute.make_rmem_tensor((2,), Float32)
+                column = kvh * HEAD_DIM + d
+                fetch([(p.kv_new, column, 1), (p.kv_new, self.kv_dim + column, 1)], vals, epoch)
+                p.k_cache[kvh * max_len + pos, d] = BFloat16(vals[0])
+                p.v_cache[kvh * max_len + pos, d] = BFloat16(vals[1])
 
     @cute.jit
     def merge_head(self, p: AttnParams, hq, slot, obuf, epoch, lane):
