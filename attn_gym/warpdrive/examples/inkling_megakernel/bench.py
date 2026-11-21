@@ -15,8 +15,9 @@ and each row reports the median of the round medians. Default DVFS.
 import dataclasses
 import json
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, NamedTuple
 
 import torch
 import typer
@@ -34,7 +35,16 @@ from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
 )
 
 
-def capture(fn: Callable[[], object], reps: int, warmup: int = 3) -> torch.cuda.CUDAGraph:
+class Captured(NamedTuple):
+    """A graph of ``reps`` calls of ``fn``. ``fn`` stays referenced: its closure owns buffers
+    the graph's kernels read and write (runners, caches, inputs)."""
+
+    graph: torch.cuda.CUDAGraph
+    reps: int
+    fn: Callable[[], object]
+
+
+def capture(fn: Callable[[], object], reps: int, warmup: int = 3) -> Captured:
     """A graph of ``reps`` back-to-back calls of ``fn``, after ``warmup`` eager calls on the
     capture stream (compiles and allocator pools)."""
     stream = torch.cuda.Stream()
@@ -48,22 +58,19 @@ def capture(fn: Callable[[], object], reps: int, warmup: int = 3) -> torch.cuda.
                 fn()
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
-    return graph
+    return Captured(graph, reps, fn)
 
 
-def time_graphs(
-    graphs: dict[str, tuple[torch.cuda.CUDAGraph, int]], rounds: int, iters: int
-) -> dict[str, float]:
+def time_graphs(graphs: dict[str, Captured], rounds: int, iters: int) -> dict[str, float]:
     """Median over ``rounds`` interleaved rounds (each in a rotated order) of each graph's
     median replay time, divided by its calls per replay: microseconds per call."""
-    settle([g for g, _ in graphs.values()], 1.0)
+    settle([c.graph for c in graphs.values()], 1.0)
     names = list(graphs)
     medians = {name: [] for name in names}
     for r in range(rounds):
         for name in names[r % len(names) :] + names[: r % len(names)]:
-            graph, reps = graphs[name]
-            stats = benchmark_cuda_graph_stats(graph, num_iters=iters, warmup_iters=5)
-            medians[name].append(stats.median_us / reps)
+            stats = benchmark_cuda_graph_stats(graphs[name].graph, num_iters=iters, warmup_iters=5)
+            medians[name].append(stats.median_us / graphs[name].reps)
     return {name: sorted(m)[len(m) // 2] for name, m in medians.items()}
 
 
@@ -148,7 +155,7 @@ def main(
             ("torch visit", torch_visit),
             ("megakernel visit", mk_visit),
         ]:
-            graphs[f"{kind}: {name}"] = (capture(fn, reps), reps)
+            graphs[f"{kind}: {name}"] = capture(fn, reps)
 
     steps = {
         "torch": FAST,
@@ -156,10 +163,8 @@ def main(
         "both-halves hybrid": runner.kernels(),
     }
     for name, kernels in steps.items():
-        graphs[f"decode step: {name}"] = (
-            capture(lambda k=kernels: decode_step(weights, token, pos, cache, k), 1),
-            1,
-        )
+        step = partial(decode_step, weights, token, pos, cache, kernels)
+        graphs[f"decode step: {name}"] = capture(step, 1)
     results = time_graphs(graphs, rounds, iters)
     for name, us in results.items():
         print(f"{name:60s} {us:10.1f} us")
