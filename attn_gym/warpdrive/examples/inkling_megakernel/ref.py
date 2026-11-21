@@ -652,6 +652,32 @@ def decoder_layer(
 ) -> torch.Tensor:
     """One visit of ``layer`` on bf16 (tokens, hidden) ``h``; ``messages`` (tokens, 4, hidden)
     fp32 in core passes after the first."""
+    residual, blocks = kernels.attention_block(
+        config, w, layer, visit, h, blocks, messages, cache, positions, start, kernels
+    )
+    mlp_message = None if messages is None else messages[:, 3]
+    return kernels.mlp_block(
+        config, w, visit, residual, blocks, mlp_message, cache, positions, kernels
+    )
+
+
+def attention_block(
+    config: InklingConfig,
+    w: LayerWeights,
+    layer: int,
+    visit: int,
+    h: torch.Tensor,
+    blocks: list[torch.Tensor],
+    messages: torch.Tensor | None,
+    cache: InklingCache,
+    positions: torch.Tensor,
+    start: int | None,
+    kernels: "Kernels",
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """A visit's first half on its bf16 input ``h``: the attention inputs (block residual,
+    message gates, RMSNorm), attention, post-attention convolution and the residual. Returns the
+    fp32 post-attention residual and the blocks the MLP half reads (``blocks`` plus ``h`` at a
+    block boundary, where the residual restarts from the attention output)."""
     eps, full = config.rms_eps, config.is_full(layer)
     if full:
         streams = list(block_residual(w.attn_query, blocks, h).unbind(1))
@@ -676,13 +702,8 @@ def decoder_layer(
     residual = conv(cache.conv_attn[visit], attn, w.attn_conv, positions, config.conv_kernel)
     residual = residual.float()
     if layer % config.block_layers == 0:  # the attention output starts a new block
-        blocks = blocks + [h]
-    else:
-        residual = h.float() + residual
-    mlp_message = None if messages is None else messages[:, 3]
-    return kernels.mlp_block(
-        config, w, visit, residual, blocks, mlp_message, cache, positions, kernels
-    )
+        return residual, blocks + [h]
+    return h.float() + residual, blocks
 
 
 def mlp_block(
@@ -755,11 +776,12 @@ def hidden_states(
 @dataclass(frozen=True)
 class Kernels:
     """Swappable implementations with the signatures of this module's functions of the same
-    names: ``short_conv``, ``experts`` (``experts_out``) and ``mlp_block`` (a visit's MLP half,
-    which by default calls the other two)."""
+    names: ``short_conv``, ``experts`` (``experts_out``), and a visit's halves ``attention_block``
+    and ``mlp_block`` (which by default call the others)."""
 
     short_conv: Callable = short_conv
     experts: Callable = experts_out
+    attention_block: Callable = attention_block
     mlp_block: Callable = mlp_block
 
 
