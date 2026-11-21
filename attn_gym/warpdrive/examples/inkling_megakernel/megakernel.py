@@ -336,8 +336,8 @@ class AttnLaunch:
     def __init__(self, op: InklingAttnKernel, device, trace: str | None = None):
         self.workspace, self.max_ctas = op.work.launch_args(torch.device(device))
         self.table = build_attn_table(op, self.max_ctas).to(device)
-        if trace is not None:  # a work item and each of its regions per row of a CTA
-            events = 8 * -(-self.table.shape[0] // self.max_ctas) + 16
+        if trace is not None:  # a work item, its regions and ring waits per row of a CTA
+            events = 32 * -(-self.table.shape[0] // self.max_ctas) + 64
             op = op.with_settings(trace_backend=trace, trace_events_per_role=events)
         self.op = op
         self.scratch = torch.zeros(op.scratch_size, device=device, dtype=torch.int64)
