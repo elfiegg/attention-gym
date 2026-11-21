@@ -156,8 +156,9 @@ def test_graph_replay_and_compile_reuse():
     for pos, blocks in [(0, 1), (1, 4), (17, 2), (1000, 3)]:
         positions.fill_(pos)
         graph.replay()
-        residual, states = random_state(CONFIG, blocks, seed=pos)
-        runner(w, residual, states, ring, positions)
+        # New inputs for the eager launch; the graph keeps reading the captured ones.
+        other_residual, other_states = random_state(CONFIG, blocks, seed=pos)
+        runner(w, other_residual, other_states, ring, positions)
     info = compile_mlp_kernel.cache_info()
     assert info.currsize == entries
     assert info.misses == before.misses
