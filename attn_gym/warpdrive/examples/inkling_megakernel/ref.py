@@ -17,7 +17,14 @@ The numerics follow ``transformers``' ``modeling_inkling2_loop`` (branch ``add-i
 bf16 projections, fp32 block attention residuals, message gates, routing and short
 convolutions, and bf16 attention scores with an fp32 softmax that includes a per-head sink
 logit. Expert weights are dequantized from the checkpoint's NVFP4 (layers 0-19) and MXFP8
-(layers 20-23) to bf16, as HF does; activations are not quantized.
+(layers 20-23) to bf16; activations are not quantized.
+
+Parity: given the same weights, ``forward_tokens`` equals HF's eager model (eager attention,
+``experts_implementation="eager"``) bit for bit on the tiny test model and on short real
+prompts, prefill and decode; long prefills match to rounding noise (GEMM heuristics change with
+the row count). The weights differ in one place: HF's loader rounds the NVFP4 ``amax`` and
+``outer_scale_denominator`` to bf16 before dequantizing; this loader keeps the checkpoint's fp32
+values (a ~0.4% scale change on some experts).
 """
 
 import json
