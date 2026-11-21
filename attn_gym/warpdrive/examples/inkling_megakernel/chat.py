@@ -7,7 +7,10 @@ Backends:
 
 - ``reference``: the oracle, one eager step at a time (a host sync per step: no CUDA graph);
 - ``torch``: ``fast.decode_step`` (the oracle's dataflow on capturable kernels) in CUDA graphs;
-- ``compile``: the same step under torch.compile (minutes to compile cold), in CUDA graphs.
+- ``compile``: the same step under torch.compile (minutes to compile cold), in CUDA graphs;
+- ``megakernel``: the ``torch`` step with each plain visit's MLP half as one warpdrive
+  megakernel launch (``megakernel.InklingMlpMegakernel``; visits with messages stay on torch),
+  in CUDA graphs.
 
 Replies are sequences of ``<|message_model|><|content_X|>...<|end_message|>`` parts, ``X`` being
 ``thinking`` or ``text``, closed by ``<|content_model_end_sampling|>``; the reply shows thinking
@@ -64,10 +67,29 @@ class Torch:
         return self.fn(self.weights, token, pos, self.cache)
 
 
+class Megakernel:
+    """``fast.decode_step`` with the megakernel MLP half (stage S1 of the Inkling megakernel),
+    captured by the chat's CUDA graphs."""
+
+    capturable = True
+
+    def __init__(self, weights, cache: InklingCache):
+        from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
+            InklingMlpMegakernel,
+        )
+
+        self.weights, self.cache = weights, cache
+        self.kernels = InklingMlpMegakernel(weights.config, weights.layers).kernels()
+
+    def step(self, token: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        return decode_step(self.weights, token, pos, self.cache, self.kernels)
+
+
 BACKENDS = {
     "reference": Reference,
     "torch": Torch,
     "compile": functools.partial(Torch, compile=True),
+    "megakernel": Megakernel,
 }
 DEFAULT_BACKEND = "torch"
 
