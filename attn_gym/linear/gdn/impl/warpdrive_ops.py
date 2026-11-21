@@ -23,36 +23,42 @@ from attn_gym.linear._delta_rule.paged_state import PagedState
 from attn_gym.linear._delta_rule.validation import validate_packed_offsets_tensor
 
 # The registered op names keep the backend's former ``cudnn`` name so that serialized graphs
-# and exported programs that reference them still load.
+# and exported programs that reference them still load. ``batch_invariant`` comes last and
+# defaults to ``False``, the shape-dependent plans, so those graphs' positional arguments bind
+# as before and keep their bits. The dispatcher drops trailing arguments left at their schema
+# default, so every Python impl and fake repeats the default.
 torch.library.define(
     "attn_gym::gdn_chunk_cudnn_packed_fwd",
     "(Tensor q, Tensor k, Tensor value, Tensor gate, Tensor beta, Tensor cu_seqlens, "
-    "bool split, float scale) -> Tensor",
+    "bool split, float scale, bool batch_invariant=False) -> Tensor",
 )
 torch.library.define(
     "attn_gym::gdn_chunk_cudnn_packed_fwd_with_initial_state",
     "(Tensor q, Tensor k, Tensor value, Tensor gate, Tensor beta, Tensor initial_state, "
-    "Tensor cu_seqlens, float scale) -> Tensor",
+    "Tensor cu_seqlens, float scale, bool batch_invariant=False) -> Tensor",
 )
 torch.library.define(
     "attn_gym::gdn_chunk_cudnn_packed_fwd_with_state",
     "(Tensor q, Tensor k, Tensor value, Tensor gate, Tensor beta, Tensor initial_state, "
-    "Tensor cu_seqlens, float scale) -> (Tensor, Tensor)",
+    "Tensor cu_seqlens, float scale, bool batch_invariant=False) -> (Tensor, Tensor)",
 )
 torch.library.define(
     "attn_gym::gdn_chunk_cudnn_packed_fwd_paged",
     "(Tensor q, Tensor k, Tensor value, Tensor gate, Tensor beta, Tensor(a!) state_cache, "
-    "Tensor state_indices, Tensor? has_initial_state, Tensor cu_seqlens, float scale) -> Tensor",
+    "Tensor state_indices, Tensor? has_initial_state, Tensor cu_seqlens, float scale, "
+    "bool batch_invariant=False) -> Tensor",
 )
 torch.library.define(
     "attn_gym::gdn_chunk_cudnn_packed_bwd",
     "(Tensor q, Tensor k, Tensor value, Tensor gate, Tensor beta, Tensor d_output, "
-    "Tensor cu_seqlens, bool split, float scale) -> (Tensor, Tensor, Tensor, Tensor, Tensor)",
+    "Tensor cu_seqlens, bool split, float scale, bool batch_invariant=False) "
+    "-> (Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
 torch.library.define(
     "attn_gym::gdn_chunk_cudnn_packed_bwd_with_state",
     "(Tensor q, Tensor k, Tensor value, Tensor gate, Tensor beta, Tensor d_output, "
-    "Tensor initial_state, Tensor? d_final_state, Tensor cu_seqlens, float scale) "
+    "Tensor initial_state, Tensor? d_final_state, Tensor cu_seqlens, float scale, "
+    "bool batch_invariant=False) "
     "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
 
@@ -114,6 +120,7 @@ def _packed_fwd_cuda(
     cu_seqlens: Tensor,
     split: bool,
     scale: float,
+    batch_invariant: bool = False,
 ) -> Tensor:
     """Run the fixed-arity forward launcher; its prologue kernel checks the packed boundaries."""
     value_template = value
@@ -132,6 +139,7 @@ def _packed_fwd_cuda(
         scale=scale,
         output_final_state=False,
         split=split,
+        batch_invariant=batch_invariant,
     )
     return _copy_to_layout(output, value_template)
 
@@ -145,6 +153,7 @@ def _packed_fwd_with_initial_state_cuda(
     initial_state: Tensor,
     cu_seqlens: Tensor,
     scale: float,
+    batch_invariant: bool = False,
 ) -> Tensor:
     """Run the fixed-arity forward launcher; its prologue kernel checks the packed boundaries."""
     value_template = value
@@ -164,6 +173,7 @@ def _packed_fwd_with_initial_state_cuda(
         initial_state,
         scale=scale,
         output_final_state=False,
+        batch_invariant=batch_invariant,
     )
     return _copy_to_layout(output, value_template)
 
@@ -177,6 +187,7 @@ def _packed_fwd_with_state_cuda(
     initial_state: Tensor,
     cu_seqlens: Tensor,
     scale: float,
+    batch_invariant: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """Run the fixed-arity forward launcher; its prologue kernel checks the packed boundaries."""
     value_template, state_template = value, initial_state
@@ -196,6 +207,7 @@ def _packed_fwd_with_state_cuda(
         initial_state,
         scale=scale,
         output_final_state=True,
+        batch_invariant=batch_invariant,
     )
     assert final_state is not None
     return _copy_to_layout(output, value_template), _copy_to_layout(final_state, state_template)
@@ -212,6 +224,7 @@ def _packed_fwd_paged_cuda(
     has_initial_state: Tensor | None,
     cu_seqlens: Tensor,
     scale: float,
+    batch_invariant: bool = False,
 ) -> Tensor:
     """Advance selected pool slots in place; the pool itself is never copied."""
     value_template = value
@@ -241,6 +254,7 @@ def _packed_fwd_paged_cuda(
         paged_state,
         scale=scale,
         output_final_state=False,
+        batch_invariant=batch_invariant,
     )
     return _copy_to_layout(output, value_template)
 
@@ -255,6 +269,7 @@ def _packed_bwd_cuda(
     cu_seqlens: Tensor,
     split: bool,
     scale: float,
+    batch_invariant: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     templates = (q, k, value, gate, beta)
     q, k, value, d_output = (normalize_tma_tensor(tensor) for tensor in (q, k, value, d_output))
@@ -270,6 +285,7 @@ def _packed_bwd_cuda(
         cu_seqlens,
         scale=scale,
         split=split,
+        batch_invariant=batch_invariant,
     )
     assert d_initial_state is None
     return tuple(
@@ -289,6 +305,7 @@ def _packed_bwd_with_state_cuda(
     d_final_state: Tensor | None,
     cu_seqlens: Tensor,
     scale: float,
+    batch_invariant: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     templates = (q, k, value, gate, beta, initial_state)
     q, k, value, d_output, initial_state = (
@@ -309,6 +326,7 @@ def _packed_bwd_with_state_cuda(
         initial_state,
         d_final_state,
         scale=scale,
+        batch_invariant=batch_invariant,
     )
     assert d_initial_state is not None
     return tuple(
@@ -349,6 +367,7 @@ def _packed_fwd_fake(
     cu_seqlens: Tensor,
     split: bool,
     scale: float,
+    batch_invariant: bool = False,
 ) -> Tensor:
     """Describe the output allocation made by the no-state forward launcher."""
     return _empty_with_layout(value)
@@ -364,6 +383,7 @@ def _packed_fwd_with_initial_state_fake(
     initial_state: Tensor,
     cu_seqlens: Tensor,
     scale: float,
+    batch_invariant: bool = False,
 ) -> Tensor:
     """Describe the output-only stateful forward launcher."""
     return _empty_with_layout(value)
@@ -379,6 +399,7 @@ def _packed_fwd_with_state_fake(
     initial_state: Tensor,
     cu_seqlens: Tensor,
     scale: float,
+    batch_invariant: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """Describe the forward output and launcher-cloned final state."""
     return _empty_with_layout(value), _empty_with_layout(initial_state)
@@ -396,6 +417,7 @@ def _packed_fwd_paged_fake(
     has_initial_state: Tensor | None,
     cu_seqlens: Tensor,
     scale: float,
+    batch_invariant: bool = False,
 ) -> Tensor:
     """Describe the paged forward launcher; the pool mutation is declared in the schema."""
     return _empty_with_layout(value)
@@ -417,6 +439,7 @@ def _packed_bwd_fake(
     cu_seqlens: Tensor,
     split: bool,
     scale: float,
+    batch_invariant: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Describe the five no-state backward gradients."""
     return tuple(_gradient_allocation(tensor) for tensor in (q, k, value, gate, beta))
@@ -434,6 +457,7 @@ def _packed_bwd_with_state_fake(
     d_final_state: Tensor | None,
     cu_seqlens: Tensor,
     scale: float,
+    batch_invariant: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Describe stateful backward gradients, including the initial-state cotangent."""
     return (

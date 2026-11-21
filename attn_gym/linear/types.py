@@ -7,7 +7,7 @@
 """Types shared by public linear-attention operations."""
 
 from enum import Enum
-from typing import Literal, NamedTuple, TypedDict, get_args
+from typing import Literal, NamedTuple, get_args
 
 import torch
 
@@ -93,11 +93,11 @@ class BackendOptions(TuningOptions, total=False):
 
 
 class SplitOptions(BackendOptions, total=False):
-    """Approximate warpdrive forgetting-horizon split schedules for chunk KDA and chunk GDN.
+    """warpdrive plan options of chunk KDA and chunk GDN (``chunk_gdn``'s ``KernelOptions``).
 
-    Both default to ``False``, require an explicit ``backend="warpdrive"``, and reject calls with
-    recurrent state. They help only when ``B * H`` does not fill the GPU and every head forgets
-    quickly.
+    All default to ``False`` and require an explicit ``backend="warpdrive"``. The approximate
+    forgetting-horizon split schedules reject calls with recurrent state; they help only when
+    ``B * H`` does not fill the GPU and every head forgets quickly.
     """
 
     split_backward: bool
@@ -105,6 +105,17 @@ class SplitOptions(BackendOptions, total=False):
 
     split_forward: bool
     """Split the forward recurrence."""
+
+    batch_invariant: bool
+    """Keep each sequence's bits independent of the rest of the packed stream: the other
+    sequences, their count, lengths and order. Covers the outputs, final states and gradients of
+    ``chunk_kda``/``chunk_gdn``, the paged ops (replay included), and the staged handles'
+    summaries and ``run``. Defaults to ``False``, where the warpdrive plans (piece chains, KDA's
+    shared prep pass, summary pieces) follow the stream's shape and SM count. ``True`` runs every
+    sequence unchained in both directions, which is slower when few long sequences leave SMs
+    idle ("Batch invariance" in ``docs/linear.md``). Bits still follow the GPU model and
+    software stack. Requires an explicit ``backend="warpdrive"`` and excludes the split
+    schedules."""
 
 
 IntraChunkDtypes = Literal["tf32+fp16", "tf32+bf16", "bf16+fp16", "bf16"]
@@ -142,27 +153,6 @@ class KernelOptions(SplitOptions, total=False):
     precision" in ``docs/linear.md``)."""
 
 
-class _StageOptions(TypedDict, total=False):
-    batch_invariant: bool
-    """Keep each sequence's context-parallel summary bits (``state_summaries`` and
-    ``state_grad_summaries``) independent of the rest of the packed stream: the other sequences,
-    their count and lengths. Defaults to ``False``, where a long sequence's summaries split into
-    pieces by a plan of the stream's shape. ``True`` scans every sequence uncut in both
-    directions. Only the warpdrive backend's summaries split, so like the split schedules it
-    requires an explicit ``backend="warpdrive"``; the handles' local ``run`` keeps its own
-    shape-dependent plan."""
-
-
-class StageKernelOptions(KernelOptions, _StageOptions, total=False):
-    """``chunk_kda_prepare`` and ``chunk_kda_prepare_backward`` options: ``chunk_kda``'s and
-    ``batch_invariant``."""
-
-
-class GDNStageKernelOptions(SplitOptions, _StageOptions, total=False):
-    """``chunk_gdn_prepare`` and ``chunk_gdn_prepare_backward`` options: ``chunk_gdn``'s and
-    ``batch_invariant``."""
-
-
 class RecurrentKernelOptions(TuningOptions, total=False):
     """Options shared by the fused ``recurrent_gdn`` and ``recurrent_kda`` scans."""
 
@@ -181,6 +171,7 @@ SPLIT_OPTION_SPEC: KernelOptionSpec = {
     "backend": (("auto", "fused", "warpdrive"), "auto"),
     "split_backward": (bool, False),
     "split_forward": (bool, False),
+    "batch_invariant": (bool, False),
 }
 KERNEL_OPTION_SPEC: KernelOptionSpec = {
     **SPLIT_OPTION_SPEC,
@@ -189,8 +180,6 @@ KERNEL_OPTION_SPEC: KernelOptionSpec = {
     "intra_chunk_dtypes": (get_args(IntraChunkDtypes), None),
 }
 RECURRENT_OPTION_SPEC: KernelOptionSpec = {**TUNING_OPTION_SPEC, "batch_invariant": (bool, False)}
-STAGE_OPTION_SPEC: KernelOptionSpec = {**KERNEL_OPTION_SPEC, "batch_invariant": (bool, False)}
-GDN_STAGE_OPTION_SPEC: KernelOptionSpec = {**SPLIT_OPTION_SPEC, "batch_invariant": (bool, False)}
 
 
 class GateTransform(str, Enum):
@@ -217,14 +206,12 @@ def resolve_gate_transform(kind: GateTransform | str) -> GateTransform:
 
 __all__ = [
     "BackendOptions",
-    "GDNStageKernelOptions",
     "GateTransform",
     "Impl",
     "KernelOptions",
     "RecurrentKernelOptions",
     "ReplayState",
     "SplitOptions",
-    "StageKernelOptions",
     "StateCheckpoints",
     "TuningOptions",
     "resolve_gate_transform",

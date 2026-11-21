@@ -24,6 +24,7 @@ def chunk_gdn_bwd_warpdrive_packed(
     *,
     scale: float | None = None,
     split: bool = False,
+    batch_invariant: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -36,6 +37,7 @@ def chunk_gdn_bwd_warpdrive_packed(
 
     Few (sequence, head) tiles run as an exact piece chain when it pays. ``split`` enables
     the approximate forgetting-horizon work table instead and requires a no-state call.
+    ``batch_invariant`` pins the plan so a sequence's bits do not depend on the rest of the pack.
     ``dgate`` is zero past ``cu_seqlens[-1]``; the other token gradients are unspecified there.
     """
     if split and (initial_state is not None or d_final_state is not None):
@@ -61,6 +63,7 @@ def chunk_gdn_bwd_warpdrive_packed(
             initial_state=initial_state,
             d_final_state=d_final_state,
             split=split,
+            batch_invariant=batch_invariant,
         )
         return (*(gradient.unsqueeze(0) for gradient in gradients), d_initial_state)
 

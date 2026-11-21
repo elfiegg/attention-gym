@@ -86,7 +86,9 @@ def chunk_gdn(
             With ``{"backend": "warpdrive"}``, ``split_forward`` and ``split_backward`` opt into
             its approximate forgetting-horizon split schedules (see
             :class:`attn_gym.linear.types.SplitOptions`) for calls without ``initial_state`` or
-            ``output_final_state``. ``"autotune"`` (default ``True``) benchmarks candidate
+            ``output_final_state``; ``batch_invariant`` makes each sequence's output, final state
+            and gradients independent of the rest of the pack ("Batch invariance" in
+            ``docs/linear.md``). ``"autotune"`` (default ``True``) benchmarks candidate
             configurations of the Triton fused kernels; winners are cached and reused. When
             ``False``, and always under ``torch.use_deterministic_algorithms(True)``, the forward
             and backward launch fixed configurations, so bits repeat across processes and
@@ -115,6 +117,7 @@ def chunk_gdn(
                 output_final_state=output_final_state,
                 split_backward=options["split_backward"],
                 split_forward=options["split_forward"],
+                batch_invariant=options["batch_invariant"],
             )
         return fused_chunk_forward(
             q,
@@ -182,8 +185,8 @@ def paged_chunk_gdn(
         has_initial_state: Optional contiguous boolean mask, one per logical sequence. False
             entries start from zero and overwrite the selected slot.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
-        kernel_options: Backend options. ``"backend"`` selects the kernels as in ``chunk_gdn``.
-            Split schedules are not supported. ``"autotune"``
+        kernel_options: Backend options. ``"backend"`` and ``"batch_invariant"`` apply as in
+            ``chunk_gdn``. Split schedules are not supported. ``"autotune"``
             (default ``True``) benchmarks candidate configurations of the Triton factor and
             output kernels. When ``False``, and always under
             ``torch.use_deterministic_algorithms(True)``, they launch fixed configurations.
@@ -232,6 +235,7 @@ def paged_chunk_gdn(
             cu_seqlens=cu_seqlens,
             has_initial_state=has_initial_state,
             scale=scale,
+            batch_invariant=options["batch_invariant"],
         )
     return fused_paged_chunk_forward(
         q,

@@ -188,6 +188,18 @@ class ForwardPlan:
         return cls(pieces, 1, num_sm) if pieces else cls.uncut(num_seqs, heads_out, dim_v, num_sm)
 
     @classmethod
+    def invariant(cls, num_seqs: int, heads_out: int, dim_v: int, device):
+        """The plan ``batch_invariant`` runs: unchained, so a sequence's bits follow its own tokens
+        and state, not the rest of the pack. Its d_v split still follows the pack but keeps the
+        bits of whole-d_v tiles: each value row of the state evolves alone, and both tiles repeat
+        the key-side work. KDA's shared prep does change them, so its driver skips it."""
+        # TODO: unchained, one long sequence scans serially (3-8x the default plan at 32K
+        # tokens). Cutting each sequence's pieces from its own length on the device (a span that
+        # grows with the sequence, the walk pinned to 16 rows) kept the bits pack-independent
+        # and measured within 10% of the default (see this option's commit message).
+        return cls.uncut(num_seqs, heads_out, dim_v, _num_sm(device))
+
+    @classmethod
     def uncut(cls, num_seqs: int, heads_out: int, dim_v: int, num_sm: int):
         """The unchained plan, for shapes the chain does not serve (paged prefill) or loses on.
 
@@ -223,6 +235,11 @@ class BackwardPlan:
         num_sm = _num_sm(device)
         pieces = _chain_pieces(tokens, num_seqs, heads_out, num_sm, b_t, chain_cost, reverse=True)
         return cls(pieces, num_sm)
+
+    @classmethod
+    def invariant(cls, device):
+        """The uncut plan ``batch_invariant`` runs; see ``ForwardPlan.invariant``."""
+        return cls(0, _num_sm(device))
 
 
 def split_scratch(

@@ -119,10 +119,10 @@ def resolve_chunk_kernel_options(
 ) -> dict[str, Any]:
     """Resolve chunk options using ``SPLIT_OPTION_SPEC`` or an extension of it.
 
-    Split schedules and the staged handles' ``batch_invariant`` require an explicit
-    ``backend="warpdrive"``. The backend's former name, ``"cudnn"``, still
-    selects it and warns once per process, outside ``torch.compile`` tracing (Dynamo cannot trace
-    ``warnings.warn`` in a full graph).
+    Split schedules and ``batch_invariant`` require an explicit ``backend="warpdrive"`` and
+    exclude each other: the split work tables follow the stream's shape. The backend's former
+    name, ``"cudnn"``, still selects it and warns once per process, outside ``torch.compile``
+    tracing (Dynamo cannot trace ``warnings.warn`` in a full graph).
 
     A staged backward passes its saved tape's backend as ``tape_backend``: the tape fixes the
     backend, so an omitted or ``"auto"`` backend resolves to it, ``"fused"`` or ``"warpdrive"``
@@ -143,6 +143,8 @@ def resolve_chunk_kernel_options(
     for name in ("split_backward", "split_forward", "batch_invariant"):
         if options.get(name) and options["backend"] != "warpdrive":
             raise ValueError(f"{name} requires kernel_options['backend']='warpdrive'")
+    if options["batch_invariant"] and (options["split_backward"] or options["split_forward"]):
+        raise ValueError("batch_invariant excludes the split schedules")
     return options
 
 

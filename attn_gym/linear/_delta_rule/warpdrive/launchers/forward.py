@@ -41,6 +41,7 @@ def run_forward_on_current_device(
     fastmath: bool = True,
     intra_chunk_dtypes: str,
     nonempty: bool = False,
+    batch_invariant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Validate and launch one packed forward invocation.
 
@@ -49,7 +50,8 @@ def run_forward_on_current_device(
     approximate and only offered for calls without recurrent state. ``fastmath=False`` selects
     the non-flushing gate exponentials. ``intra_chunk_dtypes`` selects the operand precision
     (``KernelOptions``). ``nonempty`` promises that every sequence holds a token (dense
-    batches), so the final state needs no seeding for empty sequences.
+    batches), so the final state needs no seeding for empty sequences. ``batch_invariant`` pins
+    the plan so a sequence's bits do not depend on the rest of the pack.
     """
     paged_state = state if isinstance(state, PagedState) else None
     if split and (state is not None or output_final_state):
@@ -120,6 +122,7 @@ def run_forward_on_current_device(
         fastmath=fastmath,
         intra_chunk_dtypes=intra_chunk_dtypes,
         nonempty=nonempty,
+        batch_invariant=batch_invariant,
     )
     return output.unsqueeze(0), final_state
 
@@ -139,6 +142,7 @@ def run_forward(
     fastmath: bool = True,
     intra_chunk_dtypes: str,
     nonempty: bool = False,
+    batch_invariant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch under the input tensor's CUDA device guard."""
     if not q.is_cuda:
@@ -158,6 +162,7 @@ def run_forward(
             fastmath=fastmath,
             intra_chunk_dtypes=intra_chunk_dtypes,
             nonempty=nonempty,
+            batch_invariant=batch_invariant,
         )
 
 

@@ -169,13 +169,6 @@ the fused kernels, strongest first:
   (GB300). The fused decode ops (`recurrent_kda_decode`, `recurrent_gdn_decode`)
   do not support it. For batch-invariant decode, apply `gate_transform`, the beta
   sigmoid and `l2norm` yourself, then call the scan with one token per sequence.
-- **Warpdrive context-parallel summaries with `kernel_options={"backend": "warpdrive",
-  "batch_invariant": True}` on `chunk_kda_prepare` / `chunk_gdn_prepare` (and their backward
-  handles): bitwise across packs.** By default a long sequence's `state_summaries` and
-  `state_grad_summaries` split into pieces whose length follows the packed stream's shape, so
-  its bits change with the other sequences. The option scans every sequence uncut in both
-  directions. It does not cover the handles' `run`, whose plan still follows the stream's
-  shape; like the split schedules, it requires an explicit `"backend": "warpdrive"`.
 - **CUDA-graph replay: bitwise** by construction, and the intended serving mode
   for decode.
 - **Across lowerings: never bitwise.** Dense versus packed, chunked versus
@@ -198,14 +191,22 @@ Pass `kernel_options={"backend": "fused"}` to get the fused guarantees above ins
   Its atomics only claim work items and append rows to its work tables; repeating a call with
   the same inputs and shapes reproduces the output, final-state and gradient bits
   (`test/test_linear_default_backend.py`).
-- **Across batch compositions: not bitwise.** The plan (forward and backward piece chains, the
-  KDA value split and its prep pass, the piece length of the staged and context-parallel
-  summaries) follows the packed shape and the SM count, so a sequence's bits can change with
-  the other sequences packed beside it, and between GPU models with different SM counts. When
-  the summaries split, the staged `run` reuses their pieces, so its bits follow that piece
-  length too and differ from the public op's on the same stream.
+- **Across batch compositions: not bitwise by default.** The plan (forward and backward piece
+  chains, the KDA value split and its prep pass, the piece length of the staged and
+  context-parallel summaries) follows the packed shape and the SM count, so a sequence's bits can
+  change with the other sequences packed beside it, and between GPU models with different SM
+  counts. When the summaries split, the staged `run` reuses their pieces, so its bits follow that
+  piece length too and differ from the public op's on the same stream.
   [Document-aligned fragments](linear.md#document-aligned-fragments-cp-invariant-bits) gives
   measured examples.
+- **`kernel_options={"backend": "warpdrive", "batch_invariant": True}`: bitwise across
+  batch compositions.** `chunk_kda`, `chunk_gdn` (outputs, final states, all gradients), their
+  paged forms (replay included), and the staged and context-parallel handles (summaries and
+  `run`) give a sequence the same bits alone or anywhere in any pack, on one GPU model and
+  software stack. Every sequence runs unchained and its summaries uncut, which costs up to
+  several times the default on a few long sequences and nothing on packs that already run
+  unchained ([Batch invariance](linear.md#batch-invariance)). Like the split schedules it
+  requires an explicit `"backend": "warpdrive"`, and it excludes them.
 - **Across `intra_chunk_dtypes` values: not bitwise.** The default `"tf32+bf16"` changes the
   BF16 bits of earlier releases; `kernel_options={"intra_chunk_dtypes": "bf16"}` reproduces them
   ([Operand precision](linear.md#operand-precision)). FP16 inputs have one value and unchanged

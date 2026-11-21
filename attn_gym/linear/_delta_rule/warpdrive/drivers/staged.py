@@ -249,15 +249,15 @@ def plan_tables(launch: _Launch | None) -> tuple[torch.Tensor | None, ...]:
 
 
 def restore_plan(tape: NamedTuple, *, batch_invariant: bool) -> _Launch | None:
-    """The plan of a tape with :func:`plan_tables`' fields; a backward's ``batch_invariant``
-    request must not contradict a split one."""
-    if tape.plan_work_items is None:
-        return None
-    if batch_invariant:
+    """The plan of a tape with :func:`plan_tables`' fields and the forward's
+    ``batch_invariant``, which a backward's ``batch_invariant`` request must not contradict."""
+    if batch_invariant and not tape.batch_invariant:
         raise ValueError(
             "kernel_options['batch_invariant']=True does not match the saved tape, whose "
-            "forward split its summaries"
+            "forward ran without it"
         )
+    if tape.plan_work_items is None:
+        return None
     return _Launch.restore(
         tape.plan_work_items, tape.plan_work_count, tape.plan_cu_pieces, tape.plan_main_rows
     )

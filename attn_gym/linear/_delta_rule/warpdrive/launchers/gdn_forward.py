@@ -38,12 +38,14 @@ def run_forward_on_current_device(
     scale: float | None,
     output_final_state: bool,
     split: bool = False,
+    batch_invariant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Validate and launch one packed scalar-GDN forward.
 
     A ``PagedState`` is advanced in place and produces no separate final state. ``split``
     enables the approximate forgetting-horizon work table (see ``work_tables.py``)
-    and is only offered for calls without recurrent state.
+    and is only offered for calls without recurrent state. ``batch_invariant`` pins the plan so a
+    sequence's bits do not depend on the rest of the pack.
     """
     if split and (state is not None or output_final_state):
         raise ValueError("the split forward schedule requires a no-state call")
@@ -115,6 +117,7 @@ def run_forward_on_current_device(
         split=split,
         state_indices=None if paged_state is None else paged_state.indices,
         has_initial_state=None if paged_state is None else paged_state.byte_mask,
+        batch_invariant=batch_invariant,
     )
     return output.unsqueeze(0), final_state
 
@@ -131,6 +134,7 @@ def run_forward(
     scale: float | None,
     output_final_state: bool,
     split: bool = False,
+    batch_invariant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch under the input tensor's CUDA device guard."""
     if not q.is_cuda:
@@ -147,6 +151,7 @@ def run_forward(
             scale=scale,
             output_final_state=output_final_state,
             split=split,
+            batch_invariant=batch_invariant,
         )
 
 

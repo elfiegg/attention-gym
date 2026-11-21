@@ -696,13 +696,20 @@ def test_prepare_backward_rejects_split_schedules(op):
 def test_prepare_backward_takes_the_backend_from_the_tape(op):
     """The saved tape fixes the backward's backend: options may omit it or pass ``"auto"``, and
     ``batch_invariant`` is checked against the tape, not the default backend. An explicit backend
-    naming the other one raises rather than running the tape's kernels."""
+    naming the other one, or ``batch_invariant`` against a forward that ran without it, raises
+    rather than running the tape's kernels."""
     q, k, v, gate, beta = op.make_inputs(128, seed=8)
     prepared = op.prepare(q, k, v, gate, beta)
     backward = partial(op.prepare_backward, prepared.saved, None, None, scale=prepared.scale)
     assert type(backward(kernel_options={"backend": "auto"})) is type(backward())
     if op.warpdrive:
-        assert backward(kernel_options={"batch_invariant": True}).batch_invariant
+        invariant = {"backend": "warpdrive", "batch_invariant": True}
+        pinned = op.prepare(q, k, v, gate, beta, kernel_options=invariant)
+        assert op.prepare_backward(
+            pinned.saved, None, None, scale=pinned.scale, kernel_options={"batch_invariant": True}
+        ).batch_invariant
+        with pytest.raises(ValueError, match="does not match the saved"):
+            backward(kernel_options={"batch_invariant": True})
         mismatch = {"backend": "fused"}
     else:
         mismatch = {"backend": "warpdrive", "batch_invariant": True}

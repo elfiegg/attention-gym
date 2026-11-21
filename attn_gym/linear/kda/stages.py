@@ -70,7 +70,7 @@ from attn_gym.linear.kda.validation import (
     resolve_kernel_options,
     validate_kda_inputs,
 )
-from attn_gym.linear.types import StageKernelOptions
+from attn_gym.linear.types import KernelOptions
 
 if TYPE_CHECKING:
     from attn_gym.linear._delta_rule.warpdrive.drivers.staged import (
@@ -106,7 +106,10 @@ class ChunkKDAWarpdriveSaved(NamedTuple):
     arbitrary-range summaries. warpdrive always runs packed, so the offsets are never ``None``.
     The ``plan_*`` tables are the forward's split summary plan, ``None`` when its summaries ran
     uncut: the backward runs the same pieces (NOTE [Staged piece plans] in
-    ``attn_gym.linear._delta_rule.warpdrive.drivers.staged``).
+    ``attn_gym.linear._delta_rule.warpdrive.drivers.staged``). The type records the forward's
+    ``kernel_options["batch_invariant"]``, which the backward repeats: a pinned forward's tape is
+    a :class:`ChunkKDAWarpdriveInvariantSaved`, so ``type(saved)._make(tensors)`` (the
+    context-parallel op's ``save_for_backward`` round trip) keeps it.
     """
 
     q: torch.Tensor
@@ -121,6 +124,15 @@ class ChunkKDAWarpdriveSaved(NamedTuple):
     plan_work_count: torch.Tensor | None = None
     plan_cu_pieces: torch.Tensor | None = None
     plan_main_rows: torch.Tensor | None = None
+
+    batch_invariant = False
+
+
+class ChunkKDAWarpdriveInvariantSaved(ChunkKDAWarpdriveSaved):
+    """The tape of a ``batch_invariant`` warpdrive forward (:class:`ChunkKDAWarpdriveSaved`)."""
+
+    __slots__ = ()
+    batch_invariant = True
 
 
 # NOTE [Summary ranges are subsequences]
@@ -302,10 +314,13 @@ class ChunkKDAWarpdrivePrepared:
             self.scale,
             self.fastmath,
         )
-        dtypes = {"intra_chunk_dtypes": self.intra_chunk_dtypes}
+        options = {
+            "intra_chunk_dtypes": self.intra_chunk_dtypes,
+            "batch_invariant": self.batch_invariant,
+        }
         if output_final_state:
-            return chunk_warpdrive_packed_fwd_with_state_op(*args, **dtypes)
-        return chunk_warpdrive_packed_fwd_with_initial_state_op(*args, **dtypes), None
+            return chunk_warpdrive_packed_fwd_with_state_op(*args, **options)
+        return chunk_warpdrive_packed_fwd_with_initial_state_op(*args, **options), None
 
 
 def chunk_kda_prepare(
@@ -318,7 +333,7 @@ def chunk_kda_prepare(
     cu_seqlens: torch.Tensor | None = None,
     scale: float | None = None,
     fastmath: bool = True,
-    kernel_options: StageKernelOptions | None = None,
+    kernel_options: KernelOptions | None = None,
 ) -> ChunkKDAPrepared | ChunkKDAWarpdrivePrepared:
     """Run the factor half of ``chunk_kda`` and return a handle for summaries and output.
 
@@ -331,10 +346,10 @@ def chunk_kda_prepare(
     of the local pass and both summaries as in ``chunk_kda``, so the default runs warpdrive on
     SM100-family GPUs. Split schedules are not available with entry states. ``"autotune"`` and
     ``"intra_chunk_dtypes"`` follow ``chunk_kda``; ``"batch_invariant"`` (explicit
-    ``"warpdrive"`` only) keeps each sequence's summary bits independent of the rest of the
-    stream (:class:`attn_gym.linear.types.StageKernelOptions`).
+    ``"warpdrive"`` only) keeps each sequence's summary and ``run`` bits independent of the rest
+    of the stream (:class:`attn_gym.linear.types.KernelOptions`).
     """
-    options = resolve_kernel_options(kernel_options, op_name="chunk_kda_prepare", staged=True)
+    options = resolve_kernel_options(kernel_options, op_name="chunk_kda_prepare")
     backend, autotune, schedule = options.backend, options.autotune, options.schedule
     if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by chunk_kda_prepare")
@@ -367,8 +382,10 @@ def chunk_kda_prepare(
         validate_warpdrive_constraints(q, v)
         from attn_gym.linear._delta_rule.warpdrive.drivers import staged
 
-        launch = None if options.batch_invariant else staged.plan(staged.KDA, v[0], cu_seqlens)
-        saved = ChunkKDAWarpdriveSaved(
+        invariant = options.batch_invariant
+        launch = None if invariant else staged.plan(staged.KDA, v[0], cu_seqlens)
+        tape = ChunkKDAWarpdriveInvariantSaved if invariant else ChunkKDAWarpdriveSaved
+        saved = tape(
             q, k, v, gate, cumulative_gate, beta, cu_seqlens, chunk_offsets,
             *staged.plan_tables(launch),
         )  # fmt: skip
@@ -377,7 +394,7 @@ def chunk_kda_prepare(
             intra_chunk_dtypes=intra_chunk_dtypes,
         )  # fmt: skip
         return ChunkKDAWarpdrivePrepared(
-            saved, metadata, scale, fastmath, intra_chunk_dtypes, options.batch_invariant, pieces
+            saved, metadata, scale, fastmath, intra_chunk_dtypes, invariant, pieces
         )
     factors = _prepare_chunk_kda_fwd(
         q,
@@ -492,7 +509,7 @@ class ChunkKDAWarpdriveBackward:
     # The forward's ``intra_chunk_dtypes``, which the checkpoint recompute and the forward
     # transitions the reverse maps transpose repeat.
     intra_chunk_dtypes: str
-    batch_invariant: bool = False  # The forward's summaries ran uncut (its tape has no plan).
+    batch_invariant: bool = False  # The forward's (``saved.batch_invariant``), pinning ``run``.
     # Set when the summaries split (NOTE [Staged piece plans] in
     # ``attn_gym.linear._delta_rule.warpdrive.drivers.staged``).
     pieces: BackwardPieces | None = None
@@ -523,7 +540,8 @@ class ChunkKDAWarpdriveBackward:
             bounds=bounds,
             fastmath=self.fastmath,
             intra_chunk_dtypes=self.intra_chunk_dtypes,
-            batch_invariant=self.batch_invariant,
+            # Uncut exactly when the forward's summaries were: its tape has no plan.
+            batch_invariant=saved.plan_work_items is None,
         )
 
     def run(
@@ -566,6 +584,7 @@ class ChunkKDAWarpdriveBackward:
                 self.scale,
                 self.fastmath,
                 self.intra_chunk_dtypes,
+                self.batch_invariant,
             )
             return (*grads, None)
         return chunk_warpdrive_packed_bwd_with_state_op(
@@ -576,6 +595,7 @@ class ChunkKDAWarpdriveBackward:
             self.scale,
             self.fastmath,
             self.intra_chunk_dtypes,
+            self.batch_invariant,
         )
 
 
@@ -586,7 +606,7 @@ def chunk_kda_prepare_backward(
     *,
     scale: float,
     fastmath: bool = True,
-    kernel_options: StageKernelOptions | None = None,
+    kernel_options: KernelOptions | None = None,
 ) -> ChunkKDABackward | ChunkKDAWarpdriveBackward:
     """Recompute the local backward tensors before any reverse-summary exchange.
 
@@ -600,15 +620,15 @@ def chunk_kda_prepare_backward(
     (``"intra_chunk_dtypes"``). The tape selects the backend: a warpdrive tape
     (:class:`ChunkKDAWarpdriveSaved`) returns :class:`ChunkKDAWarpdriveBackward`.
     ``"backend"`` may be omitted or ``"auto"``; ``"fused"`` or ``"warpdrive"`` must name the tape's
-    backend. A warpdrive tape also fixes the summary plan: the backward runs the forward's pieces
-    whatever its own ``"batch_invariant"``, and ``True`` against a tape whose forward split raises.
+    backend. A warpdrive tape also fixes the plans: the backward runs the forward's pieces and pins
+    its plans exactly when the forward did, whatever its own ``"batch_invariant"``; ``True``
+    against a tape whose forward ran without it raises.
     """
     d_output, scale = normalize_backward_span(saved.v, saved.q.shape[-1], d_output, scale)
     warpdrive = isinstance(saved, ChunkKDAWarpdriveSaved)
     options = resolve_kernel_options(
         kernel_options,
         op_name="chunk_kda_prepare_backward",
-        staged=True,
         tape_backend="warpdrive" if warpdrive else "fused",
     )
     intra_chunk_dtypes = resolve_intra_chunk_dtypes(
@@ -637,7 +657,7 @@ def chunk_kda_prepare_backward(
             scale,
             fastmath,
             intra_chunk_dtypes,
-            launch is None,
+            saved.batch_invariant,
             pieces,
         )
     metadata = None
@@ -682,6 +702,7 @@ __all__ = [
     "ChunkKDAPrepared",
     "ChunkKDASaved",
     "ChunkKDAWarpdriveBackward",
+    "ChunkKDAWarpdriveInvariantSaved",
     "ChunkKDAWarpdrivePrepared",
     "ChunkKDAWarpdriveSaved",
     "chunk_kda_prepare",

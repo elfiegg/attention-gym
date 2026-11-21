@@ -160,7 +160,9 @@ def chunk_kda(
             ``"intra_chunk_dtypes"`` (default ``"tf32+bf16"``) selects warpdrive's intra-chunk
             operand dtypes for BF16 inputs ("Operand precision" in ``docs/linear.md``); FP16
             inputs run ``"tf32+fp16"``, their one kernel set, and reject any other value, on
-            every backend.
+            every backend. ``"batch_invariant"`` (explicit ``"warpdrive"`` only) makes each
+            sequence's output, final state and gradients independent of the rest of the pack
+            ("Batch invariance" in ``docs/linear.md``).
 
     Returns:
         The output in ``q.dtype`` and either an FP32 final state with one entry
@@ -200,6 +202,7 @@ def chunk_kda(
                 split_backward=options.split_backward,
                 split_forward=options.split_forward,
                 intra_chunk_dtypes=intra_chunk_dtypes,
+                batch_invariant=options.batch_invariant,
             )
         return _fused_chunk_forward(
             q,
@@ -273,7 +276,8 @@ def paged_chunk_kda(
         kernel_options: Backend-specific options. ``"backend"`` selects the kernels as in
             ``chunk_kda``, for replay-backed calls too.
             ``split_backward`` and ``split_forward`` are not supported by this paged
-            operation; ``schedule`` and ``intra_chunk_dtypes`` apply as in ``chunk_kda``.
+            operation; ``schedule``, ``intra_chunk_dtypes`` and ``batch_invariant`` apply as in
+            ``chunk_kda``, for replay-backed calls too.
             ``"autotune"`` (default ``True``) benchmarks candidate configurations of the Triton
             fused kernels; warpdrive uses its fixed schedule.
         replay_state: Optional :class:`ReplayState` persistent cache.
@@ -351,6 +355,7 @@ def paged_chunk_kda(
             scale=resolve_scale(None, q.shape[-1]),
             replay_state=replay_state,
             intra_chunk_dtypes=intra_chunk_dtypes,
+            batch_invariant=options.batch_invariant,
         )
     return _fused_paged_chunk_forward(
         q,
