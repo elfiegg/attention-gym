@@ -355,7 +355,7 @@ class InklingAttnKernel(WarpSpecialized):
         epoch = p.state[0] + 1
         pos = Int32(p.pos[0])
         self.normalize_inputs(p, tid, warp, lane)
-        obuf = Int32(self.streams + 1)
+        obuf = Int32(self.streams)
         while work.valid:
             op, a, b, _row = work.item
             if op == QKV:
@@ -375,7 +375,7 @@ class InklingAttnKernel(WarpSpecialized):
             else:
                 # Alternate o_proj input buffers: every warp passed the last merge's barrier
                 # after finishing the row before it, the last reader of this buffer.
-                obuf = 2 * self.streams + 3 - obuf
+                obuf = 2 * self.streams + 1 - obuf
                 if warp < self.heads_per_split:
                     self.merge_head(p, b * self.heads_per_split + warp, warp, obuf, epoch, lane)
                 self.csync.sync()
