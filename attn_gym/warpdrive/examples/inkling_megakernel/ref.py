@@ -654,12 +654,33 @@ def decoder_layer(
         blocks = blocks + [h]
     else:
         residual = h.float() + residual
+    mlp_message = None if messages is None else messages[:, 3]
+    return kernels.mlp_block(
+        config, w, visit, residual, blocks, mlp_message, cache, positions, kernels
+    )
+
+
+def mlp_block(
+    config: InklingConfig,
+    w: LayerWeights,
+    visit: int,
+    residual: torch.Tensor,
+    blocks: list[torch.Tensor],
+    message: torch.Tensor | None,
+    cache: InklingCache,
+    positions: torch.Tensor,
+    kernels: "Kernels",
+) -> torch.Tensor:
+    """A visit's second half on the fp32 (tokens, hidden) post-attention ``residual``: block
+    residual over ``blocks`` (this layer's, including its input at a block boundary), the MLP
+    message gate (core passes after the first), RMSNorm, routed experts, post-MLP convolution and
+    the residual add. Returns the visit's bf16 output."""
     x = block_residual(w.mlp_query[None], blocks, residual)[:, 0]
-    if messages is not None:
-        x = message_gate(w.gates[3], x, messages[:, 3], eps)
-    x = rms_norm(x, w.post_norm, eps).to(torch.bfloat16)
+    if message is not None:
+        x = message_gate(w.gates[3], x, message, config.rms_eps)
+    x = rms_norm(x, w.post_norm, config.rms_eps).to(torch.bfloat16)
     y = kernels.experts(config, w, x, *route(config, w, x))
-    y = conv(cache.conv_mlp[visit], y, w.mlp_conv, positions, config.conv_kernel)
+    y = kernels.short_conv(cache.conv_mlp[visit], y, w.mlp_conv, positions, config.conv_kernel)
     return (residual + y.float()).to(torch.bfloat16)
 
 
@@ -708,12 +729,13 @@ def hidden_states(
 
 @dataclass(frozen=True)
 class Kernels:
-    """Swappable implementations: ``short_conv(ring, x, weight, positions, kernel)`` and
-    ``experts(config, layer_weights, x, experts, weights)``, with the signatures of this module's
-    ``short_conv`` and ``experts_out``."""
+    """Swappable implementations with the signatures of this module's functions of the same
+    names: ``short_conv``, ``experts`` (``experts_out``) and ``mlp_block`` (a visit's MLP half,
+    which by default calls the other two)."""
 
     short_conv: Callable = short_conv
     experts: Callable = experts_out
+    mlp_block: Callable = mlp_block
 
 
 REFERENCE = Kernels()
