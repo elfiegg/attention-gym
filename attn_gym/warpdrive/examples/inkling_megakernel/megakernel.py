@@ -48,10 +48,8 @@ from attn_gym.warpdrive.examples.inkling_megakernel.attn_kernel import (
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     GATE_RANK,
     GATE_TILES,
-    GATEMIX,
     GATES,
     MAX_BLOCKS,
-    MSGDOWN,
     RING,
     WORDS,
 )
@@ -177,20 +175,13 @@ def deal(rows: list[list[int]], ctas: int) -> list[list[list[int]]]:
     return [rows[c::ctas] for c in range(ctas)]
 
 
-def gate_rows(op: InklingAttnKernel | InklingMlpKernel) -> list[list[int]]:
-    """A launch's message-gate rows in dependency order: MSGDOWN tiles, then GATEMIX tiles
-    gate by gate (none without messages)."""
-    rows = [[MSGDOWN, t, 0] for t in range(op.gates * GATE_TILES)]
-    return rows + [[GATEMIX, t, s] for s in range(op.gates) for t in range(op.hidden // ROWS)]
-
-
 def build_attn_table(op: InklingAttnKernel, ctas: int) -> torch.Tensor:
     """The attention launch's table for ``StaticPersistent``: message-gate rows, QKV tiles
     (attention's projections first, the gate and sink last), ATTN items split-major, then OPROJ
     rows split-major, dealt round-robin. Every CTA's rows stay in that order, so with all CTAs
     resident the earliest unfinished row has its producers finished; the last split's OPROJ
     rows, which reduce their tiles, follow the rows they poll."""
-    rows = gate_rows(op)
+    rows = op.gate_rows()
     rows += [[QKV, t, m] for m in op.matrices for t in range(op.proj_tiles[m])]
     rows += [[ATTN, hq, s] for s in range(op.splits) for hq in range(op.q_heads)]
     rows += [[OPROJ, t, s] for s in range(O_SPLITS) for t in range(op.row_tiles)]
@@ -225,7 +216,7 @@ def build_table(op: InklingMlpKernel, ctas: int) -> torch.Tensor:
         cta = min(range(ctas), key=lambda c: (load[c], c))
         lists[cta].insert(0, [ROUTER, tile, 0])
         load[cta] += op.hidden_k_tiles
-    gates = deal(gate_rows(op), ctas)
+    gates = deal(op.gate_rows(), ctas)
     return table_of([g + rows for g, rows in zip(gates, lists)])
 
 
@@ -311,7 +302,8 @@ def device_position(positions: torch.Tensor) -> torch.Tensor:
 class InklingMlpMegakernel:
     """Launch state of the MLP-half kernels for ``config`` (without and with the message gate)
     and bf16 router copies of ``layers``. Launches of one runner must run one at a time in
-    stream order (each kind's launches share a scratch and an epoch)."""
+    stream order (each kind's launches share a scratch and an epoch). ``trace``: as
+    ``InklingAttnMegakernel``'s (into ``launches[messages].trace_buffer``)."""
 
     def __init__(
         self,
@@ -319,10 +311,11 @@ class InklingMlpMegakernel:
         layers: tuple[LayerWeights, ...],
         stages: int | None = None,
         device="cuda",
+        trace: str | None = None,
     ):
         self.config = config
         self.launches = {
-            messages: Launch(mlp_kernel_for(config, messages, stages), build_table, device)
+            messages: Launch(mlp_kernel_for(config, messages, stages), build_table, device, trace)
             for messages in (False, True)
         }
         self.op = self.launches[False].op
@@ -371,6 +364,7 @@ class InklingMlpMegakernel:
             ring,
             device_position(positions),
             out,
+            launch.trace_buffer,
             launch.scratch,
             launch.state,
             launch.table,

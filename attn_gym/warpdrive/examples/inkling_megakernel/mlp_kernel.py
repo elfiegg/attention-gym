@@ -60,7 +60,6 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
-    GATE_RANK,
     GATEMIX,
     MAX_BLOCKS,
     MIX_FLOATS,
@@ -98,7 +97,7 @@ ROUTER, GATEUP, DOWN = range(3)
 MAX_STAGES = 12
 # MlpParams fields passed to the kernel as one tuple of argument tensors, in this order.
 TENSOR_ARGS = (
-    "state", "pos", "residual", "query", "norms", "conv", "router_bias", "ring", "mhalf",
+    "trace_buffer", "state", "pos", "residual", "query", "norms", "conv", "router_bias", "ring", "mhalf",
     "messages", "out",
 )  # fmt: skip
 
@@ -199,9 +198,7 @@ class InklingMlpKernel(InklingKernel):
             "act": self.top_k * self.width,
             "down": self.top_k * self.hidden,
         }
-        if self.messages:
-            shapes.update(h_part=self.gates * GATE_RANK, gated=self.gates * self.hidden)
-        return shapes
+        return shapes | self.gate_scratch_shapes()
 
     @property
     def scratch_offsets(self) -> dict[str, int]:
@@ -268,7 +265,7 @@ class InklingMlpKernel(InklingKernel):
             op, a, b, _row = work.item
             if cutlass.const_expr(self.messages):
                 if op == MSGDOWN:
-                    w = self.msgdown(p, w, a, epoch, warp, lane)
+                    w = self.msgdown(p, w, a, b, epoch, warp, lane)
                 elif op == GATEMIX:
                     w = self.gatemix(p, w, a, b, epoch, warp, lane)
                 elif gathered == 0:
@@ -448,6 +445,7 @@ class InklingMlpKernel(InklingKernel):
         # Materialize the argument tensors in converged code: a first use inside one role's
         # branch would not dominate the other roles' uses.
         tensors = {k: cute.make_tensor(t.iterator, t.layout) for k, t in zip(TENSOR_ARGS, tensors)}
+        trace_buffer = tensors.pop("trace_buffer")
         blocks = tuple(cute.make_tensor(t.iterator, t.layout) for t in blocks)
         offsets = self.scratch_offsets
         tagged = {
@@ -501,7 +499,7 @@ class InklingMlpKernel(InklingKernel):
             **tagged,
             **tensors,
         )
-        self.run_roles(params)
+        self.run_roles(params, trace_buffer=trace_buffer)
 
     @cute.jit
     def __call__(
@@ -526,6 +524,7 @@ class InklingMlpKernel(InklingKernel):
         ring: cute.Tensor,
         pos: cute.Tensor,
         out: cute.Tensor,
+        trace_buffer: cute.Tensor,
         scratch: cute.Tensor,
         state: cute.Tensor,
         table: cute.Tensor,
@@ -551,7 +550,7 @@ class InklingMlpKernel(InklingKernel):
         if cutlass.const_expr(self.messages):
             gate_pairs = gate_atoms(gate_down, gate_fg, self.hidden)
         bound = self.work.bind(table, workspace, max_ctas)
-        tensors = (state, pos, residual, query, norms, conv, router_bias, ring, mhalf, messages,
+        tensors = (trace_buffer, state, pos, residual, query, norms, conv, router_bias, ring, mhalf, messages,
                    out)  # fmt: skip
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(
@@ -590,6 +589,7 @@ def compile_mlp_kernel(op: InklingMlpKernel):
         make_fake_compact_tensor(bf16, (RING, h), assumed_align=2),
         make_fake_compact_tensor(Int32, (1,), assumed_align=4),  # pos
         make_fake_compact_tensor(bf16, (h,), assumed_align=2),
+        make_fake_compact_tensor(Int64, (cute.sym_int(),)),  # trace buffer (globaltimer only)
         make_fake_compact_tensor(Int64, (op.scratch_size,)),
         make_fake_compact_tensor(Int32, (2,), assumed_align=4),
         make_fake_compact_tensor(Int32, (cute.sym_int(), WORDS)),

@@ -69,7 +69,6 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
-    GATE_RANK,
     GATEMIX,
     MAX_BLOCKS,
     MIX_FLOATS,
@@ -320,9 +319,7 @@ class InklingAttnKernel(InklingKernel):
             "o_part": O_SPLITS * self.hidden,
             "kv_new": 2 * self.kv_dim,
         }
-        if self.messages:
-            shapes.update(h_part=self.gates * GATE_RANK, gated=self.gates * self.hidden)
-        return shapes
+        return shapes | self.gate_scratch_shapes()
 
     @property
     def scratch_offsets(self) -> dict[str, int]:
@@ -391,7 +388,7 @@ class InklingAttnKernel(InklingKernel):
             op, a, b, item = work.item
             if cutlass.const_expr(self.messages):
                 if op == MSGDOWN:
-                    w = self.msgdown(p, w, a, epoch, warp, lane)
+                    w = self.msgdown(p, w, a, b, epoch, warp, lane)
                 elif op == GATEMIX:
                     w = self.gatemix(p, w, a, b, epoch, warp, lane)
                 elif gathered == 0:

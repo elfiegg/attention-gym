@@ -28,6 +28,7 @@ from test_warpdrive_inkling_megakernel_mlp import random_layer as random_mlp_lay
 
 from attn_gym.warpdrive.examples.inkling_megakernel import ref
 from attn_gym.warpdrive.examples.inkling_megakernel.attn_kernel import compile_attn_kernel
+from attn_gym.warpdrive.examples.inkling_megakernel.common import GATE_SPLITS
 from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
     InklingAttnMegakernel,
     InklingMlpMegakernel,
@@ -97,7 +98,7 @@ def check_gates(config, launch, w, first: int, streams, messages, gates):
     every gated element by about 1e-3 relative: the launch outputs differ from the oracle's
     through those flips, not through the gate arithmetic.) Returns the count of flipped ``h``."""
     count, h, rank = launch.op.gates, config.hidden_size, config.gate_rank
-    h_part = tagged(launch, "h_part", count * rank).view(count, rank)
+    h_part = tagged(launch, "h_part", GATE_SPLITS * count * rank).view(GATE_SPLITS, count, rank)
     gated = tagged(launch, "gated", count * h).view(count, h)
     mhalf = gates.mhalf.view(-1, rank)
     flips = 0
@@ -105,7 +106,10 @@ def check_gates(config, launch, w, first: int, streams, messages, gates):
         gate, x, m = w.gates[first + s], streams[s], messages[0, first + s]
         inputs = torch.cat([ref.rms_norm(v, None, config.rms_eps) for v in (x, m)])
         expected = F.linear(inputs.bfloat16(), gate.down).float()
-        mine = (h_part[s] + mhalf[first + s]).bfloat16().float()
+        mine = h_part[0, s]
+        for k in range(1, GATE_SPLITS):  # the kernel's summation order
+            mine = mine + h_part[k, s]
+        mine = (mine + mhalf[first + s]).bfloat16().float()
         ulp = 2.0 ** (torch.floor(torch.log2(expected.abs())) - 7)
         assert ((mine - expected).abs() <= ulp).all(), s
         flips += int((mine != expected).sum())

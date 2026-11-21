@@ -5,15 +5,20 @@ the block-residual prologue and the message-gate work items.
 Message gates (core passes after the first, ``ref.message_gate``) run inside the attention
 and MLP launches as two kinds of work items before the launch's own::
 
-    MSGDOWN  2 per gate  32 rows of the gate's down projection x the x half of its input
-                         (bf16 rms(x), from the prologue)           -> fp32 partials (tagged)
-    GATEMIX  72 per gate 32 elements: h = bf16(partial + message half), then
+    MSGDOWN  6 per gate  32 rows of the gate's down projection x a third of the x half of its
+                         input (bf16 rms(x), from the prologue)     -> fp32 partials (tagged)
+    GATEMIX  36 per gate 64 elements: h = bf16(partials + message half), then
                          (1 - tanh(F h)) x + tanh(G h) m            -> fp32 stream (tagged)
 
 The message half of each down projection (its columns on bf16 rms(m)) and the messages ``m``
 themselves depend only on the previous pass, so ``msg_kernel`` computes them once per pass for
 every core layer. The CTAs then gather the gated streams and RMS-normalize them into the GEMV
 inputs (``gather``) before their first item of the launch's own.
+
+Sized so that a launch's message items (126 in attention, 42 in the MLP) fit one per CTA:
+every GATEMIX item then waits for the last MSGDOWN item, not for another GATEMIX item of its CTA.
+On GB300 at Inkling 2 Mini's shapes, 6 whole-K MSGDOWN tiles and 32-row GATEMIX items (two on
+some CTAs) put the gather ~9 us after the prologue.
 """
 
 import struct
@@ -50,7 +55,9 @@ RED_VALUES = 16  # values per CTA reduction
 MSGDOWN, GATEMIX = 3, 4  # message-gate ops, after each launch's own ops 0-2
 GATES = 4  # message gates per core layer: query, key, value, MLP
 GATE_RANK = 64  # rows of a gate's down projection: 8 lanes x 8 values in GATEMIX
-GATE_TILES = GATE_RANK // ROWS  # MSGDOWN tiles per gate
+GATE_TILES = GATE_RANK // ROWS  # MSGDOWN row tiles per gate
+GATE_SPLITS = 3  # MSGDOWN split-K: k tiles of the x half per item = hidden / 256 / GATE_SPLITS
+MIX_STAGES = 2  # GATEMIX: 32-row stages of [F | G] per item
 # MIX: the prologue's state scale factors (STATES), then each query's state weights (STATES).
 MIX_FLOATS = STATES * 4
 
@@ -136,12 +143,19 @@ def gate_atoms(down, fg, hidden: int) -> list:
 
 
 @dataclass(frozen=True)
+class Inputs:
+    """The params ``CudaCoreGemv.tile`` reads: its input rows ``xs``."""
+
+    xs: cute.Tensor
+
+
+@dataclass(frozen=True)
 class GateParams:
     """A launch's message-gate operands for one core layer (``InklingKernel.messages``)."""
 
     tma: tuple  # TMA atoms: the down projections' x halves, the [F | G] rows
     gmem: tuple  # their tile partitions: (TMA, row tiles, k tiles)
-    h_part: cute.Tensor  # tagged int64 (gates * GATE_RANK,) x-half dots
+    h_part: cute.Tensor  # tagged int64 (GATE_SPLITS, gates, GATE_RANK) x-half partial dots
     gated: cute.Tensor  # tagged int64 (gates * hidden,) gated streams
     mhalf: cute.Tensor  # (GATES * GATE_RANK,) fp32 message-half dots (msg_kernel)
     messages: cute.Tensor  # (GATES, hidden) fp32 messages (msg_kernel)
@@ -160,6 +174,25 @@ class InklingKernel(WarpSpecialized):
     @property
     def gates(self) -> int:
         return len(self.gate_query) if self.messages else 0
+
+    def gate_scratch_shapes(self) -> dict[str, int]:
+        """Tagged words of the message items: MSGDOWN partials (split, gate, row) and the gated
+        streams (gate, element); none without messages."""
+        if not self.messages:
+            return {}
+        return {
+            "h_part": GATE_SPLITS * self.gates * GATE_RANK,
+            "gated": self.gates * self.hidden,
+        }
+
+    def gate_rows(self) -> list[list[int]]:
+        """Table rows ``[op, a, b]`` of the message items in dependency order: MSGDOWN (tile,
+        split), then GATEMIX (tile, gate); none without messages."""
+        rows = [
+            [MSGDOWN, t, k] for t in range(self.gates * GATE_TILES) for k in range(GATE_SPLITS)
+        ]
+        tiles = self.hidden // (ROWS * MIX_STAGES)
+        return rows + [[GATEMIX, t, s] for s in range(self.gates) for t in range(tiles)]
 
     def partial(self, p):
         """The partial block of the launch's block residual (a ``(hidden,)`` tensor)."""
@@ -317,26 +350,40 @@ class InklingKernel(WarpSpecialized):
 
     @cute.jit
     def load_gate_item(self, p, w, op, a, b):
-        """The load warp's stages of a MSGDOWN (tile ``a``) or GATEMIX (tile ``a`` of gate
-        ``b``) item."""
+        """The load warp's stages of a MSGDOWN (tile ``a``, split ``b``) or GATEMIX (tile ``a``
+        of gate ``b``) item."""
         g = p.gate
         if op == MSGDOWN:
             row = self.first_gate * GATE_TILES + a
-            w = load_tiles(w, g.tma[0], g.gmem[0], row, 0, self.hidden // TILE_K, "W")
+            per = self.hidden // TILE_K // GATE_SPLITS
+            w = load_tiles(w, g.tma[0], g.gmem[0], row, b * per, per, "W")
         else:
-            row = (self.first_gate + b) * (self.hidden // ROWS) + a
-            w = load_tiles(w, g.tma[1], g.gmem[1], row, 0, 1, "W")
+            for stage in cutlass.range_constexpr(MIX_STAGES):
+                row = (self.first_gate + b) * (self.hidden // ROWS) + a * MIX_STAGES + stage
+                w = load_tiles(w, g.tma[1], g.gmem[1], row, 0, 1, "W")
         return w
 
     @cute.jit
-    def msgdown(self, p, w, a, epoch, warp, lane):
-        """MSGDOWN tile ``a``: 32 rows of gate ``a // GATE_TILES``'s down projection against the
-        x half of its input (``xs`` row of its query), published unrounded."""
+    def msgdown(self, p, w, a, split, epoch, warp, lane):
+        """MSGDOWN tile ``a``, split ``split``: 32 rows of gate ``a // GATE_TILES``'s down
+        projection against a third of the x half of its input (``xs`` row of its query),
+        published unrounded."""
+        per = self.hidden // TILE_K // GATE_SPLITS
         xbuf = self.gate_input(a // GATE_TILES)
-        vals, row, chans = self.engine.tile(p, (w,), (), xbuf, self.hidden // TILE_K, warp, lane)
+        value = Float32(0.0)
+        row = Int32(0)
+        # One branch per split: the GEMV input starts at a constant (aligned) column.
+        for k in cutlass.range_constexpr(GATE_SPLITS):
+            if split == k:
+                xs = cute.make_tensor(p.xs.iterator + k * per * TILE_K, p.xs.layout)
+                vals, tile_row, chans = self.engine.tile(
+                    Inputs(xs), (w,), (), xbuf, per, warp, lane
+                )
+                value, row, w = vals[0], tile_row, chans[0]
         if self.engine.owns_row(warp, lane):
-            publish(p.gate.h_part, a * ROWS + row, vals[0], epoch)
-        return chans[0]
+            index = (split * self.gates * GATE_TILES + a) * ROWS + row
+            publish(p.gate.h_part, index, value, epoch)
+        return w
 
     @cute.jit
     def stream_value(self, p, query, i):
@@ -352,34 +399,46 @@ class InklingKernel(WarpSpecialized):
 
     @cute.jit
     def gatemix(self, p, w, tile, s, epoch, warp, lane):
-        """GATEMIX tile ``tile`` of gate ``s``: elements i of its 32 rows, ``ref.message_gate``'s
-        ``(1 - tanh(F_i . h)) x_i + tanh(G_i . h) m_i`` with ``h = bf16(x half + message half)``
-        of the gate's down projection. Warp w takes rows 4w .. 4w + 3, lane group lane // 8 a
-        row, lane j = lane % 8 its columns 8j .. 8j + 7 of F and of G (a stage holds 32 rows of
-        the fp32 ``[F | G]``)."""
+        """GATEMIX tile ``tile`` of gate ``s``: elements i of its MIX_STAGES * 32 rows,
+        ``ref.message_gate``'s ``(1 - tanh(F_i . h)) x_i + tanh(G_i . h) m_i`` with ``h =
+        bf16(x-half partials in split order + message half)`` of the gate's down projection.
+        In each stage (32 rows of the fp32 ``[F | G]``) warp w takes rows 4w .. 4w + 3, lane
+        group lane // 8 a row, lane j = lane % 8 its columns 8j .. 8j + 7 of F and of G. The
+        elements' x and m load before the poll for h, so their latency overlaps it."""
         g = p.gate
         gate = self.first_gate + s
         j = lane % 8
         row = ROWS_PER_WARP * warp + lane // 8
-        i = tile * ROWS + row
-        hv = cute.make_rmem_tensor((8,), Float32)
-        fetch_uniform([(g.h_part, s * GATE_RANK + 8 * j, 8)], hv, epoch)
+        query = self.gate_input(s)
+        xm = cute.make_rmem_tensor((MIX_STAGES, 2), Float32)
+        for stage in cutlass.range_constexpr(MIX_STAGES):
+            i = (tile * MIX_STAGES + stage) * ROWS + row
+            xm[stage, 0] = self.stream_value(p, query, i)
+            xm[stage, 1] = g.messages[gate, i]
+        hv = cute.make_rmem_tensor((GATE_SPLITS * 8,), Float32)
+        stride = self.gates * GATE_RANK
+        segments = [(g.h_part, k * stride + s * GATE_RANK + 8 * j, 8) for k in range(GATE_SPLITS)]
+        fetch_uniform(segments, hv, epoch)
         for e in cutlass.range_constexpr(8):
-            hv[e] = bf16_round(hv[e] + g.mhalf[gate * GATE_RANK + 8 * j + e])
-        forget = Float32(0.0)
-        gain = Float32(0.0)
-        with w.consume() as h:
-            stage = cute.recast_tensor(h.view("W"), Float32)  # (ROWS, 2 * GATE_RANK)
-            for e in cutlass.range_constexpr(8):
-                forget = forget + stage[row, 8 * j + e] * hv[e]
-                gain = gain + stage[row, GATE_RANK + 8 * j + e] * hv[e]
-        forget = group_sum(forget, 8)
-        gain = group_sum(gain, 8)
-        if j == 0:
-            x = self.stream_value(p, self.gate_input(s), i)
-            m = g.messages[gate, i]
-            out = (Float32(1.0) - cute.math.tanh(forget)) * x + cute.math.tanh(gain) * m
-            publish(g.gated, s * self.hidden + i, out, epoch)
+            acc = hv[e]
+            for k in cutlass.range_constexpr(1, GATE_SPLITS):
+                acc = acc + hv[8 * k + e]
+            hv[e] = bf16_round(acc + g.mhalf[gate * GATE_RANK + 8 * j + e])
+        for stage in cutlass.range_constexpr(MIX_STAGES):
+            i = (tile * MIX_STAGES + stage) * ROWS + row
+            forget = Float32(0.0)
+            gain = Float32(0.0)
+            with w.consume() as h:
+                rows = cute.recast_tensor(h.view("W"), Float32)  # (ROWS, 2 * GATE_RANK)
+                for e in cutlass.range_constexpr(8):
+                    forget = forget + rows[row, 8 * j + e] * hv[e]
+                    gain = gain + rows[row, GATE_RANK + 8 * j + e] * hv[e]
+            forget = group_sum(forget, 8)
+            gain = group_sum(gain, 8)
+            if j == 0:
+                x, m = xm[stage, 0], xm[stage, 1]
+                out = (Float32(1.0) - cute.math.tanh(forget)) * x + cute.math.tanh(gain) * m
+                publish(g.gated, s * self.hidden + i, out, epoch)
         return w
 
     @cute.jit
