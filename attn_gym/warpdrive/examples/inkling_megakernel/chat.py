@@ -8,9 +8,8 @@ Backends:
 - ``reference``: the oracle, one eager step at a time (a host sync per step: no CUDA graph);
 - ``torch``: ``fast.decode_step`` (the oracle's dataflow on capturable kernels) in CUDA graphs;
 - ``compile``: the same step under torch.compile (minutes to compile cold), in CUDA graphs;
-- ``megakernel``: the ``torch`` step with each plain visit's attention and MLP halves as one
-  warpdrive megakernel launch each (``megakernel.InklingMegakernel``; visits with messages stay
-  on torch), in CUDA graphs.
+- ``megakernel``: the step as warpdrive megakernel launches only (``megakernel.InklingDecoder``:
+  two per visit, one per core pass's messages, one for the LM head), in CUDA graphs.
 
 Replies are sequences of ``<|message_model|><|content_X|>...<|end_message|>`` parts, ``X`` being
 ``thinking`` or ``text``, closed by ``<|content_model_end_sampling|>``; the reply shows thinking
@@ -68,19 +67,18 @@ class Torch:
 
 
 class Megakernel:
-    """``fast.decode_step`` with the megakernel attention and MLP halves on plain visits
-    (stages S1-S2 of the Inkling megakernel), captured by the chat's CUDA graphs."""
+    """``megakernel.InklingDecoder``: the step as megakernel launches, captured by the chat's
+    CUDA graphs."""
 
     capturable = True
 
     def __init__(self, weights, cache: InklingCache):
-        from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import InklingMegakernel
+        from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import InklingDecoder
 
-        self.weights, self.cache = weights, cache
-        self.kernels = InklingMegakernel(weights.config, weights.layers).kernels()
+        self.decoder, self.cache = InklingDecoder(weights), cache
 
     def step(self, token: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-        return decode_step(self.weights, token, pos, self.cache, self.kernels)
+        return self.decoder(token, pos, self.cache)
 
 
 BACKENDS = {
@@ -89,7 +87,7 @@ BACKENDS = {
     "compile": functools.partial(Torch, compile=True),
     "megakernel": Megakernel,
 }
-DEFAULT_BACKEND = "torch"
+DEFAULT_BACKEND = "megakernel"
 
 
 def reply_parts(text: str) -> list[tuple[str, str, bool]]:
