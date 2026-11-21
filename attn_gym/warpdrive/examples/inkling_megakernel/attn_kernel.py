@@ -101,8 +101,8 @@ RED_VALUES = 16  # values per CTA reduction
 QKVS_FLOATS = 512  # an attention item's head vectors (see ``InklingAttnKernel.qkvs_words``)
 # AttnParams fields passed to the kernel as one tuple of argument tensors, in this order.
 TENSOR_ARGS = (
-    "state", "pos", "h", "query", "norms", "q_scale", "rel_scale", "rel_proj", "k_taps",
-    "v_taps", "attn_conv", "ring_k", "ring_v", "ring_attn", "k_cache", "v_cache", "out",
+    "trace_buffer", "state", "pos", "h", "query", "norms", "q_scale", "rel_scale", "rel_proj",
+    "k_taps", "v_taps", "attn_conv", "ring_k", "ring_v", "ring_attn", "k_cache", "v_cache", "out",
 )  # fmt: skip
 
 
@@ -354,10 +354,11 @@ class InklingAttnKernel(WarpSpecialized):
         tid, warp, lane = me.tid, me.warp, me.lane
         epoch = p.state[0] + 1
         pos = Int32(p.pos[0])
-        self.normalize_inputs(p, tid, warp, lane)
+        with self.trace_region("normalize"):
+            self.normalize_inputs(p, tid, warp, lane)
         obuf = Int32(self.streams)
         while work.valid:
-            op, a, b, _row = work.item
+            op, a, b, item = work.item
             if op == QKV:
                 vals, row, chans = self.engine.tile(
                     p, (w,), (), self.stream_of(b), self.hidden_k_tiles, warp, lane
@@ -371,14 +372,16 @@ class InklingAttnKernel(WarpSpecialized):
                 if (blk0 == blk1) & (b != newest):
                     self.publish_empty_partial(p, a, b, epoch, tid)
                 else:
-                    w = self.attention(p, w, a, b, pos, epoch, tid, warp, lane)
+                    w = self.attention(p, w, a, b, pos, epoch, tid, warp, lane, item)
             else:
                 # Alternate o_proj input buffers: every warp passed the last merge's barrier
                 # after finishing the row before it, the last reader of this buffer.
                 obuf = 2 * self.streams + 1 - obuf
-                if warp < self.heads_per_split:
-                    self.merge_head(p, b * self.heads_per_split + warp, warp, obuf, epoch, lane)
-                self.csync.sync()
+                with self.trace_region("merge", payload=item):
+                    if warp < self.heads_per_split:
+                        hq = b * self.heads_per_split + warp
+                        self.merge_head(p, hq, warp, obuf, epoch, lane)
+                    self.csync.sync()
                 vals, row, chans = self.engine.tile(
                     p, (w,), (), obuf, self.oproj_k_tiles, warp, lane
                 )
@@ -386,7 +389,8 @@ class InklingAttnKernel(WarpSpecialized):
                 if self.engine.owns_row(warp, lane):
                     publish(p.o_part, b * self.hidden + a * ROWS + row, vals[0], epoch)
                 if (b == O_SPLITS - 1) & (warp == 0):
-                    self.reduce(p, a * ROWS + lane, pos, epoch)
+                    with self.trace_region("reduce", payload=item):
+                        self.reduce(p, a * ROWS + lane, pos, epoch)
             work.advance()
         # Every CTA read the epoch before counting itself; the last one advances it for the
         # runner's next launch, which starts after this one completes.
@@ -670,7 +674,7 @@ class InklingAttnKernel(WarpSpecialized):
         return bf16_round(s + bias) * LOG2E
 
     @cute.jit
-    def attention(self, p: AttnParams, w, hq, split, pos, epoch, tid, warp, lane):
+    def attention(self, p: AttnParams, w, hq, split, pos, epoch, tid, warp, lane, item):
         """Flash-decoding partial of q head ``hq`` over KV split ``split``.
 
         Warp w scores positions 8w + 4i + g (i = 0, 1) of each 64-position block: lane group
@@ -684,7 +688,8 @@ class InklingAttnKernel(WarpSpecialized):
         blk0, blk1, newest = self.split_blocks(pos, split)
         is_newest = split == newest
         writer = is_newest & (hq % self.group == 0)  # one item per kv head
-        self.prepare_heads(p, hq, kvh, pos, writer, epoch, tid, warp, lane)
+        with self.trace_region("attn.prepare", payload=item):
+            self.prepare_heads(p, hq, kvh, pos, writer, epoch, tid, warp, lane)
         q = head_vec(p.qkvs, 0, d0)
         rel = []
         per = self.d_rel // 8
@@ -697,40 +702,41 @@ class InklingAttnKernel(WarpSpecialized):
         lsum = Float32(0.0)  # this lane group's sum of p
         o = cute.make_rmem_tensor((16,), Float32)  # this lane group's sum of p * v
         o.fill(0.0)
-        for blk in cutlass.range(blk0, blk1, unroll=1):
-            sc = cute.make_rmem_tensor((2,), Float32)
-            with w.consume() as h:
-                sK = h.view("KV")
-                for i in cutlass.range_constexpr(2):
-                    pt = 8 * warp + 4 * i + g
-                    kp = blk * BLOCK + pt
-                    kv = stage_row(sK, pt, d0)
-                    dot = Float32(0.0)
-                    for e in cutlass.range_constexpr(16):
-                        dot = dot + q[e] * kv[e]
-                    s = self.score(p, dot, pos - kp, rel, j)
-                    sc[i] = cutlass.select_((kp < pos) & (kp >= lo), s, -Float32.inf)
-            bm = cutlass.max(sc[0], sc[1])
-            bm = cutlass.max(bm, cute.arch.shuffle_sync_bfly(bm, offset=8))
-            bm = cutlass.max(bm, cute.arch.shuffle_sync_bfly(bm, offset=16))
-            m_new = cutlass.max(m, bm)
-            alpha = cute.math.exp2(m - m_new)
-            m = m_new
-            pr0 = cute.math.exp2(sc[0] - m_new)
-            pr1 = cute.math.exp2(sc[1] - m_new)
-            lsum = lsum * alpha + pr0 + pr1
-            for e in cutlass.range_constexpr(16):
-                o[e] = o[e] * alpha
-            with w.consume() as h:
-                sV = h.view("KV")
-                for i in cutlass.range_constexpr(2):
-                    pt = 8 * warp + 4 * i + g
-                    kp = blk * BLOCK + pt
-                    if (kp < pos) & (kp >= lo):  # masked: p is 0, but a stale v may be NaN
-                        vv = stage_row(sV, pt, d0)
-                        pr = pr0 if i == 0 else pr1
+        with self.trace_region("attn.blocks", payload=item):
+            for blk in cutlass.range(blk0, blk1, unroll=1):
+                sc = cute.make_rmem_tensor((2,), Float32)
+                with w.consume() as h:
+                    sK = h.view("KV")
+                    for i in cutlass.range_constexpr(2):
+                        pt = 8 * warp + 4 * i + g
+                        kp = blk * BLOCK + pt
+                        kv = stage_row(sK, pt, d0)
+                        dot = Float32(0.0)
                         for e in cutlass.range_constexpr(16):
-                            o[e] = o[e] + pr * vv[e]
+                            dot = dot + q[e] * kv[e]
+                        s = self.score(p, dot, pos - kp, rel, j)
+                        sc[i] = cutlass.select_((kp < pos) & (kp >= lo), s, -Float32.inf)
+                bm = cutlass.max(sc[0], sc[1])
+                bm = cutlass.max(bm, cute.arch.shuffle_sync_bfly(bm, offset=8))
+                bm = cutlass.max(bm, cute.arch.shuffle_sync_bfly(bm, offset=16))
+                m_new = cutlass.max(m, bm)
+                alpha = cute.math.exp2(m - m_new)
+                m = m_new
+                pr0 = cute.math.exp2(sc[0] - m_new)
+                pr1 = cute.math.exp2(sc[1] - m_new)
+                lsum = lsum * alpha + pr0 + pr1
+                for e in cutlass.range_constexpr(16):
+                    o[e] = o[e] * alpha
+                with w.consume() as h:
+                    sV = h.view("KV")
+                    for i in cutlass.range_constexpr(2):
+                        pt = 8 * warp + 4 * i + g
+                        kp = blk * BLOCK + pt
+                        if (kp < pos) & (kp >= lo):  # masked: p is 0, but a stale v may be NaN
+                            vv = stage_row(sV, pt, d0)
+                            pr = pr0 if i == 0 else pr1
+                            for e in cutlass.range_constexpr(16):
+                                o[e] = o[e] + pr * vv[e]
         # The writer stores the new K/V row after its own loads of the block holding it
         # completed; the other items reading that block mask it (scores select -inf, values
         # are skipped), so their racing reads never matter.
@@ -890,6 +896,7 @@ class InklingAttnKernel(WarpSpecialized):
         # Materialize the argument tensors in converged code: a first use inside one role's
         # branch would not dominate the other roles' uses.
         tensors = {k: cute.make_tensor(t.iterator, t.layout) for k, t in zip(TENSOR_ARGS, tensors)}
+        trace_buffer = tensors.pop("trace_buffer")
         blocks = tuple(cute.make_tensor(t.iterator, t.layout) for t in blocks)
         offsets = self.scratch_offsets
         tagged = {
@@ -930,7 +937,7 @@ class InklingAttnKernel(WarpSpecialized):
             **tagged,
             **tensors,
         )
-        self.run_roles(params)
+        self.run_roles(params, trace_buffer=trace_buffer)
 
     @cute.jit
     def __call__(
@@ -967,6 +974,7 @@ class InklingAttnKernel(WarpSpecialized):
         ring_attn: cute.Tensor,
         pos: cute.Tensor,
         out: cute.Tensor,
+        trace_buffer: cute.Tensor,
         scratch: cute.Tensor,
         state: cute.Tensor,
         table: cute.Tensor,
@@ -990,8 +998,9 @@ class InklingAttnKernel(WarpSpecialized):
             for src in (k_cache, v_cache)
         ]
         bound = self.work.bind(table, workspace, max_ctas)
-        tensors = (state, pos, h, query, norms, q_scale, rel_scale, rel_proj, k_taps, v_taps,
-                   attn_conv, ring_k, ring_v, ring_attn, k_cache, v_cache, out)  # fmt: skip
+        tensors = (trace_buffer, state, pos, h, query, norms, q_scale, rel_scale, rel_proj,
+                   k_taps, v_taps, attn_conv, ring_k, ring_v, ring_attn, k_cache, v_cache,
+                   out)  # fmt: skip
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             tuple(a for a, _ in pairs),
@@ -1049,6 +1058,7 @@ def compile_attn_kernel(op: InklingAttnKernel):
         make_fake_compact_tensor(bf16, (RING, h), assumed_align=2),
         make_fake_compact_tensor(Int64, (1,), assumed_align=8),
         make_fake_compact_tensor(f32, (h,), assumed_align=4),
+        make_fake_compact_tensor(Int64, (cute.sym_int(),)),  # trace buffer (globaltimer only)
         make_fake_compact_tensor(Int64, (op.scratch_size,)),
         make_fake_compact_tensor(Int32, (2,), assumed_align=4),
         make_fake_compact_tensor(Int32, (cute.sym_int(), WORDS)),

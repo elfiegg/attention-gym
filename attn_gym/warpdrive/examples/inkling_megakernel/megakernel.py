@@ -326,21 +326,28 @@ class AttnLayer:
 
 
 class AttnLaunch:
-    """One attention kernel's launch state: instruction table, tagged scratch and epoch."""
+    """One attention kernel's launch state: instruction table, tagged scratch, epoch and the
+    trace buffer (a placeholder unless a ``trace_session`` swaps in its own)."""
 
-    def __init__(self, op: InklingAttnKernel, device):
-        self.op = op
+    def __init__(self, op: InklingAttnKernel, device, trace: str | None = None):
         self.workspace, self.max_ctas = op.work.launch_args(torch.device(device))
         self.table = build_attn_table(op, self.max_ctas).to(device)
+        if trace is not None:  # a work item and each of its regions per row of a CTA
+            events = 8 * -(-self.table.shape[0] // self.max_ctas) + 16
+            op = op.with_settings(trace_backend=trace, trace_events_per_role=events)
+        self.op = op
         self.scratch = torch.zeros(op.scratch_size, device=device, dtype=torch.int64)
         self.state = torch.zeros(2, device=device, dtype=torch.int32)
+        self.trace_buffer = torch.zeros(1, device=device, dtype=torch.int64)
 
 
 class InklingAttnMegakernel:
     """Launch state of the attention-half kernels for ``config`` (one per layer kind) and the
     kernel-form arguments of ``layers``. Launches of one runner must run one at a time in stream
     order (each kind's launches share a scratch and an epoch). ``splits``: KV splits per q head
-    of (sliding, full) layers."""
+    of (sliding, full) layers. ``trace``: compile with ranges for the work items and
+    ``trace_region``s, recorded by ``"globaltimer"`` (into ``launches[full].trace_buffer``) or
+    ``"iket"``."""
 
     def __init__(
         self,
@@ -349,10 +356,11 @@ class InklingAttnMegakernel:
         splits: tuple[int | None, int | None] = (None, None),
         stages: int | None = None,
         device="cuda",
+        trace: str | None = None,
     ):
         self.config = config
         self.launches = {
-            full: AttnLaunch(attn_kernel_for(config, full, splits[full], stages), device)
+            full: AttnLaunch(attn_kernel_for(config, full, splits[full], stages), device, trace)
             for full in (False, True)
         }
         self.args = {id(w): AttnLayer.of(config, w) for w in layers}
@@ -417,6 +425,7 @@ class InklingAttnMegakernel:
             cache.conv_attn[visit],
             positions.reshape(1),
             out,
+            launch.trace_buffer,
             launch.scratch,
             launch.state,
             launch.table,
