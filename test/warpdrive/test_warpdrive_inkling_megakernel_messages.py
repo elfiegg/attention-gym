@@ -139,6 +139,8 @@ def test_messages_and_message_halves():
         inputs = ref.rms_norm(expected, None, config.rms_eps).bfloat16().float()
         down = torch.stack([torch.stack([g.down for g in w.gates]) for w in core])
         halves = torch.einsum("lgk,lgrk->lgr", inputs, down[..., h:].float())
+        # A flipped bf16 rounding of one rms(m) element moves a half by ~6e-5; a few such flips
+        # and the fp32 order bound the difference.
         torch.testing.assert_close(gates.mhalf.view_as(halves), halves, atol=2e-3, rtol=1e-3)
 
 
@@ -242,5 +244,9 @@ def test_message_visit_graph_replay_and_compile_reuse():
         assert torch.equal(out, expected), pos
         for name, tensor in vars(cache).items():
             assert torch.equal(tensor, getattr(expected_cache, name)), (pos, name)
+    for blocks in (1, 3):  # block counts are runtime values too
+        h, others = random_inputs(config, blocks, seed=blocks)
+        attention(w, layer, 0, h, others, cache, positions, residual, gates.layer(0))
+        mlp(w, residual, others, cache.conv_mlp[0], positions, out, gates.layer(0))
     assert counts == [f.cache_info().currsize for f in (compile_msg_kernel, compile_attn_kernel,
                                                         compile_mlp_kernel)]  # fmt: skip
