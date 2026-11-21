@@ -73,22 +73,38 @@ def scale_ulps(out: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
     return (out.float() - expected.float()).abs() / 2.0 ** (torch.floor(torch.log2(rms)) - 7)
 
 
-def check_visit(runner, config, w, visit, residual, blocks, cache, positions):
+def check_visit(
+    runner,
+    config,
+    w,
+    visit,
+    residual,
+    blocks,
+    cache,
+    positions,
+    message=None,
+    gates=None,
+    max_changed=MAX_CHANGED,
+):
     """One launch against ``ref.mlp_block`` on a copy of ``cache``: the same experts, the
     output and the convolution ring's new row within the budget, every other ring row
-    untouched. Returns the output's error in ulps."""
+    untouched. A visit with a ``message`` (the oracle's ``(1, hidden)``) launches with the
+    matching ``gates`` (``megakernel.GateArgs``); ``max_changed`` bounds the fraction of
+    changed outputs. Returns the output's error in ulps."""
     theirs = ref.InklingCache(**{k: v.clone() for k, v in vars(cache).items()})
     expected = ref.mlp_block(
-        config, w, visit, residual, blocks, None, theirs, positions, ref.REFERENCE
+        config, w, visit, residual, blocks, message, theirs, positions, ref.REFERENCE
     )
     ring = cache.conv_mlp[visit]
-    out = runner(w, residual, blocks, ring, positions)
+    out = runner(w, residual, blocks, ring, positions, gates=gates)
     x = ref.block_residual(w.mlp_query[None], blocks, residual)[:, 0]
+    if message is not None:
+        x = ref.message_gate(w.gates[3], x, message, config.rms_eps)
     x = ref.rms_norm(x, w.post_norm, config.rms_eps).to(torch.bfloat16)
     experts = ref.route(config, w, x)[0][0].sort().values
-    assert torch.equal(runner.routed_experts(w), experts)
+    assert torch.equal(runner.routed_experts(w, gates is not None), experts)
     errors = scale_ulps(out, expected[0])
-    assert errors.max() <= MAX_ULPS and (errors > 0).float().mean() <= MAX_CHANGED, errors.max()
+    assert errors.max() <= MAX_ULPS and (errors > 0).float().mean() <= max_changed, errors.max()
     slot = int(positions) % ref.CONV_RING
     others = torch.arange(ref.CONV_RING, device="cuda") != slot
     assert torch.equal(ring[others], theirs.conv_mlp[visit][others])

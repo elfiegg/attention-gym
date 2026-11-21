@@ -1,9 +1,11 @@
 """The MoE MLP half of one Inkling 2 Mini decode visit as one persistent warpdrive launch
 (``InklingMlpKernel``) and its compile function; ``megakernel`` holds the host side.
 
-Batch one, one token. The launch implements ``ref.mlp_block`` for a plain visit (no message)::
+Batch one, one token. The launch implements ``ref.mlp_block``::
 
     every CTA   prologue: block residual over [blocks..., residual], RMSNorm -> bf16 x (SMEM)
+    [messages]  MSGDOWN, GATEMIX of the MLP gate (``common``), then each CTA gathers the gated
+                stream and RMS-normalizes it into x
     ROUTER  4   32 router rows x hidden                       -> fp32 logits (tagged)
     GATEUP  576 slot s x tile t: 16 gate + 16 up rows of the  -> bf16 softcapped SwiGLU (tagged)
                 slot's expert x hidden
@@ -34,7 +36,6 @@ follow each other in a stream or a CUDA graph.
 """
 
 import math
-import struct
 from dataclasses import dataclass
 
 import cutlass
@@ -53,16 +54,35 @@ from attn_gym.warpdrive import (
     StaticPersistent,
     Tma,
     Warps,
-    WarpSpecialized,
     WorkCursor,
     WorkStream,
     role,
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
+from attn_gym.warpdrive.examples.inkling_megakernel.common import (
+    GATE_RANK,
+    GATEMIX,
+    MAX_BLOCKS,
+    MIX_FLOATS,
+    MSGDOWN,
+    RED_VALUES,
+    REDUCTIONS,
+    RING,
+    SMEM_BYTES,
+    SMEM_HEADROOM,
+    WORDS,
+    GateParams,
+    InklingKernel,
+    fake_gate_args,
+    fetch_uniform,
+    fp32_reciprocal,
+    gate_atoms,
+    load_tiles,
+    scratch_offsets,
+)
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     COMPUTE_THREADS,
     COMPUTE_WARPS,
-    EVICT_FIRST,
     ROWS,
     STAGE_BYTES,
     TILE_K,
@@ -71,54 +91,16 @@ from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     bf16_round,
     fetch,
     group_sum,
-    load_words,
     publish,
-    unpack_tagged,
 )
 
 ROUTER, GATEUP, DOWN = range(3)
-WORDS = 4  # op, a, b, table row
-MAX_BLOCKS = 4  # completed blocks of a block residual; the partial block is the fifth state
-RING = 16  # ref.CONV_RING: positions of the post-MLP convolution's input ring
 MAX_STAGES = 12
-SMEM_BYTES = 232448  # SM100 per-block shared memory (227 KB)
-SMEM_HEADROOM = 1024
-REDUCTIONS = 3  # prologue CTA reductions: state norms, query dots, the input's norm
 # MlpParams fields passed to the kernel as one tuple of argument tensors, in this order.
 TENSOR_ARGS = (
-    "state", "pos", "residual", "query", "post_norm", "conv", "router_bias", "ring", "out"
+    "state", "pos", "residual", "query", "norms", "conv", "router_bias", "ring", "mhalf",
+    "messages", "out",
 )  # fmt: skip
-
-
-def fp32(x: float) -> float:
-    """``x`` rounded to fp32, as a Python float."""
-    return struct.unpack("f", struct.pack("f", x))[0]
-
-
-def fp32_reciprocal(x: float) -> float:
-    """``1 / x`` in fp32: PyTorch divides a CUDA tensor by a Python scalar as a multiplication by
-    this reciprocal."""
-    return fp32(1.0 / fp32(x))
-
-
-@cute.jit
-def fetch_uniform(segments, out, epoch):
-    """``fetch`` polled until every lane of the warp has all its words, so the lanes leave the
-    loop together: lanes leaving a divergent poll loop one by one and then waiting at a shuffle
-    for the rest measured a fixed ~17k-cycle stall. Every lane of the warp must call it."""
-    ready = Int32(0)
-    while ready == 0:
-        mine = Int32(1)
-        start = 0
-        for s in cutlass.range_constexpr(len(segments)):
-            buf, index, count = segments[s]
-            words = load_words(buf, index, count)
-            for e in cutlass.range_constexpr(count):
-                value, tag = unpack_tagged(words[e])
-                out[start + e] = value
-                mine = mine & Int32(tag == epoch)
-            start += count
-        ready = Int32(cute.arch.vote_all_sync(mine != 0))
 
 
 @dataclass(frozen=True)
@@ -127,27 +109,32 @@ class MlpParams:
     gmem: tuple  # their tile partitions: (TMA, row tiles, k tiles)
     sW: StageView
     xs: cute.Tensor  # (3, hidden) bf16: the normalized input, then two activation buffers
-    red: cute.Tensor  # (REDUCTIONS, COMPUTE_WARPS, 8) fp32 prologue reductions
+    red: cute.Tensor  # (REDUCTIONS, COMPUTE_WARPS, RED_VALUES) fp32 prologue reductions
+    mix: cute.Tensor  # (MIX_FLOATS,) fp32 the prologue's block-residual weights (messages)
     route: cute.Tensor  # (2, 2 * top_k) fp32: slot s's expert at s, its weight at top_k + s
     logits: cute.Tensor  # tagged int64 (experts,)
     act: cute.Tensor  # tagged int64 (top_k * width,)
     down: cute.Tensor  # tagged int64 (top_k * hidden,)
+    gate: GateParams | None  # the MLP message gate (``messages`` kernels)
     state: cute.Tensor  # int32 (2,): launch epoch, finished CTAs
-    pos: cute.Tensor  # int64 (1,) position of the token
+    pos: cute.Tensor  # int32 (1,) position of the token
     residual: cute.Tensor  # (hidden,) fp32
     blocks: tuple  # MAX_BLOCKS (hidden,) bf16 completed blocks; the first num_blocks are read
     num_blocks: Int32
-    query: cute.Tensor  # (hidden,) fp32 block-residual query
-    post_norm: cute.Tensor  # (hidden,) bf16
+    query: cute.Tensor  # (1, hidden) fp32 block-residual query
+    norms: cute.Tensor  # (1, hidden) bf16 post-attention RMSNorm weight
     conv: cute.Tensor  # (hidden, kernel) fp32 post-MLP taps, the last on the current token
     router_bias: cute.Tensor  # (experts,) fp32
     ring: cute.Tensor  # (RING, hidden) bf16 the visit's post-MLP convolution inputs
+    mhalf: cute.Tensor  # (GATES * GATE_RANK,) fp32 message halves (read when ``messages``)
+    messages: cute.Tensor  # (GATES, hidden) fp32
     out: cute.Tensor  # (hidden,) bf16
 
 
-class InklingMlpKernel(WarpSpecialized):
+class InklingMlpKernel(InklingKernel):
     """One visit's MoE MLP half (see the module docstring). Constructor arguments are the model
-    sizes and constants the kernel reads; ``stages``: weight ring depth in 16 KB stages."""
+    sizes and constants the kernel reads; ``messages``: a core visit after the first pass, whose
+    input passes through the MLP message gate; ``stages``: weight ring depth in 16 KB stages."""
 
     def __init__(
         self,
@@ -160,6 +147,7 @@ class InklingMlpKernel(WarpSpecialized):
         gate_softcap: float,
         up_softcap: float,
         route_scale: float,
+        messages: bool = False,
         stages: int | None = None,
     ):
         if hidden % COMPUTE_THREADS or hidden % TILE_K:
@@ -175,11 +163,15 @@ class InklingMlpKernel(WarpSpecialized):
         self.rms_eps = rms_eps
         self.gate_softcap, self.up_softcap = gate_softcap, up_softcap
         self.route_scale = route_scale
+        self.messages = messages
+        self.first_gate = 3  # the MLP gate
+        self.gate_query = (0,)
         self.hidden_k_tiles = hidden // TILE_K
         self.down_k_tiles = -(-width // TILE_K)  # the last stage's columns past width are zero
         self.gate_tiles = width // (ROWS // 2)  # gate/up tiles per slot: 16 (gate, up) pairs
         self.row_tiles = hidden // ROWS  # down tiles per slot
-        fixed = 2 * 3 * hidden + 4 * (REDUCTIONS * COMPUTE_WARPS * 8 + 4 * top_k) + SMEM_HEADROOM
+        fixed = 2 * 3 * hidden + SMEM_HEADROOM
+        fixed += 4 * (REDUCTIONS * COMPUTE_WARPS * RED_VALUES + MIX_FLOATS + 4 * top_k)
         fit = (SMEM_BYTES - fixed) // STAGE_BYTES
         stages = min(MAX_STAGES, fit) if stages is None else stages
         if not 2 <= stages <= fit:
@@ -189,6 +181,7 @@ class InklingMlpKernel(WarpSpecialized):
         w = self.smem_plan.buffer("W", BFloat16, align=1024)
         self.smem_plan.buffer("X", BFloat16, align=16)
         self.smem_plan.buffer("RED", Float32, align=16)
+        self.smem_plan.buffer("MIX", Float32, align=16)
         # Routing by slot (expert, weight), one row for the load warp, one for compute warp 0.
         self.smem_plan.buffer("ROUTE", Float32, align=16)
         # Compute reads stages with generic loads before TMA refills them; the layer emits the
@@ -201,28 +194,30 @@ class InklingMlpKernel(WarpSpecialized):
     @property
     def scratch_shapes(self) -> dict[str, int]:
         """Tagged int64 words of each per-launch intermediate."""
-        return {
+        shapes = {
             "logits": self.experts,
             "act": self.top_k * self.width,
             "down": self.top_k * self.hidden,
         }
+        if self.messages:
+            shapes.update(h_part=self.gates * GATE_RANK, gated=self.gates * self.hidden)
+        return shapes
 
     @property
     def scratch_offsets(self) -> dict[str, int]:
-        offsets, offset = {}, 0
-        for name, size in self.scratch_shapes.items():
-            offsets[name] = offset
-            offset += (size + 15) // 16 * 16  # 128-byte aligned
-        return offsets
+        return scratch_offsets(self.scratch_shapes)[0]
 
     @property
     def scratch_size(self) -> int:
-        return sum((size + 15) // 16 * 16 for size in self.scratch_shapes.values())
+        return scratch_offsets(self.scratch_shapes)[1]
+
+    def partial(self, p: MlpParams):
+        return p.residual
 
     def get_name(self) -> str:
         return (
-            f"warpdrive_inkling_mlp_h{self.hidden}_i{self.width}_e{self.experts}k{self.top_k}"
-            f"_s{self.stages}{self.trace_key()}"
+            f"warpdrive_inkling_mlp{'_msg' if self.messages else ''}_h{self.hidden}"
+            f"_i{self.width}_e{self.experts}k{self.top_k}_s{self.stages}{self.trace_key()}"
         )
 
     # ------------------------------------------------------------------ roles
@@ -239,8 +234,8 @@ class InklingMlpKernel(WarpSpecialized):
         while work.valid:
             op, a, b, _row = work.item
             if op == ROUTER:
-                w = self.load_tiles(w, tma_router, g_router, a, self.hidden_k_tiles)
-            else:
+                w = load_tiles(w, tma_router, g_router, a, 0, self.hidden_k_tiles, "W")
+            elif op <= DOWN:
                 # The expert rows follow the routing: wait for the router's logits once.
                 if routed == 0:
                     self.route(p, lane, epoch, 0)
@@ -248,39 +243,37 @@ class InklingMlpKernel(WarpSpecialized):
                 expert = Int32(p.route[0, b])
                 if op == GATEUP:
                     tile = expert * self.gate_tiles + a
-                    w = self.load_tiles(w, tma_gu, g_gu, tile, self.hidden_k_tiles)
+                    w = load_tiles(w, tma_gu, g_gu, tile, 0, self.hidden_k_tiles, "W")
                 else:
                     tile = expert * self.row_tiles + a
-                    w = self.load_tiles(w, tma_down, g_down, tile, self.down_k_tiles)
+                    w = load_tiles(w, tma_down, g_down, tile, 0, self.down_k_tiles, "W")
+            if cutlass.const_expr(self.messages):
+                if op >= MSGDOWN:
+                    w = self.load_gate_item(p, w, op, a, b)
             work.advance()
         return w, work
-
-    @cute.jit
-    def load_tiles(self, w, atom, tiles, row, count: cutlass.Constexpr):
-        """``count`` stages of tiles ``(row, k)``; weights are read once per launch, hence
-        evict-first in L2."""
-        for k in cutlass.range_constexpr(count):
-            with w.produce() as h:
-                cute.copy(
-                    atom,
-                    tiles[None, row, k],
-                    h.view("W"),
-                    tma_bar_ptr=h.barrier,
-                    cache_policy=Int64(EVICT_FIRST),
-                )
-        return w
 
     @role(warps=range(COMPUTE_WARPS))
     @cute.jit
     def compute(self, p: MlpParams, *, w: Consumer, work: WorkCursor, me: Local):
         tid, warp, lane = me.tid, me.warp, me.lane
         epoch = p.state[0] + 1
-        self.normalize_input(p, tid, warp, lane)
+        x = self.load_states(p, p.residual, tid)
+        self.normalize_states(p, x, p.query, 1, Int32(1), tid, warp, lane)
         held = Int32(-1)  # the slot whose activations the current buffer holds
         abuf = Int32(1)
         routed = Int32(0)
+        gathered = Int32(0)
         while work.valid:
             op, a, b, _row = work.item
+            if cutlass.const_expr(self.messages):
+                if op == MSGDOWN:
+                    w = self.msgdown(p, w, a, epoch, warp, lane)
+                elif op == GATEMIX:
+                    w = self.gatemix(p, w, a, b, epoch, warp, lane)
+                elif gathered == 0:
+                    self.gather(p, epoch, tid, warp, lane)
+                    gathered = Int32(1)
             xbuf = Int32(0)
             if op == DOWN:
                 if b != held:
@@ -298,7 +291,7 @@ class InklingMlpKernel(WarpSpecialized):
                 )
                 w = chans[0]
                 self.epilogue(p, op, a, b, vals[0], row, epoch, warp, lane)
-            else:
+            elif op < DOWN:
                 vals, row, chans = self.engine.tile(
                     p, (w,), (), xbuf, self.hidden_k_tiles, warp, lane
                 )
@@ -310,103 +303,10 @@ class InklingMlpKernel(WarpSpecialized):
                     routed = Int32(1)
                 self.reduce(p, a * ROWS + lane, epoch)
             work.advance()
-        # Every CTA read the epoch before counting itself; the last one advances it for the
-        # runner's next launch, which starts after this one completes.
-        if tid == 0:
-            ctas = cute.arch.grid_dim()[0]
-            finished = cute.arch.atomic_add(
-                p.state.iterator + 1, Int32(1), sem="acq_rel", scope="gpu"
-            )
-            if finished == ctas - 1:
-                cute.arch.atomic_exch(p.state.iterator + 1, Int32(0), scope="gpu")
-                p.state[0] = epoch
+        self.advance_epoch(p, tid, epoch)
         return w, work
 
     # ------------------------------------------------------------ compute helpers
-
-    @cute.jit
-    def cta_sum(self, p: MlpParams, vals, slot: cutlass.Constexpr, warp, lane):
-        """Sums of each of ``vals`` (at most 8 per-thread values) over the compute threads, in
-        every thread; ``slot`` picks a RED region of its own, so no barrier guards its reuse."""
-        n = len(vals)
-        for i in cutlass.range_constexpr(n):
-            v = group_sum(vals[i], 32)
-            if lane == 0:
-                p.red[slot, warp, i] = v
-        self.csync.sync()
-        out = []
-        for i in cutlass.range_constexpr(n):
-            total = Float32(0.0)
-            for wi in cutlass.range_constexpr(COMPUTE_WARPS):
-                total = total + p.red[slot, wi, i]
-            out.append(total)
-        return out
-
-    @cute.jit
-    def normalize_input(self, p: MlpParams, tid, warp, lane):
-        """``xs[0]`` = bf16(post_norm * rms_norm(block_residual(query, blocks, residual))),
-        ``ref.mlp_block``'s expert input. Thread t holds elements ``r * 256 + t`` of each state:
-        the completed blocks, then the residual (the partial block)."""
-        h = self.hidden
-        per = h // COMPUTE_THREADS
-        states = MAX_BLOCKS + 1
-        nb = p.num_blocks
-        x = cute.make_rmem_tensor((states, per), Float32)
-        x.fill(0.0)
-        for n in cutlass.range_constexpr(MAX_BLOCKS):
-            if n < nb:
-                for r in cutlass.range_constexpr(per):
-                    x[n, r] = Float32(p.blocks[n][r * COMPUTE_THREADS + tid])
-        for r in cutlass.range_constexpr(per):
-            x[MAX_BLOCKS, r] = p.residual[r * COMPUTE_THREADS + tid]
-        squares = []
-        for n in cutlass.range_constexpr(states):
-            ss = Float32(0.0)
-            for r in cutlass.range_constexpr(per):
-                ss = ss + x[n, r] * x[n, r]
-            squares.append(ss)
-        squares = self.cta_sum(p, squares, 0, warp, lane)
-        # Unweighted RMSNorm of every state (eps 1e-6, as ref.block_residual), then the query's
-        # scores against them; empty block slots hold zeros and are masked out of the softmax.
-        inv_h = fp32_reciprocal(h)
-        dots = []
-        for n in cutlass.range_constexpr(states):
-            rinv = cute.math.rsqrt(squares[n] * inv_h + Float32(1e-6))
-            dot = Float32(0.0)
-            for r in cutlass.range_constexpr(per):
-                x[n, r] = x[n, r] * rinv
-                dot = dot + p.query[r * COMPUTE_THREADS + tid] * x[n, r]
-            dots.append(dot)
-        dots = self.cta_sum(p, dots, 1, warp, lane)
-        scale = fp32(h**-0.5)
-        scores = []
-        top = Float32(-Float32.inf)
-        for n in cutlass.range_constexpr(states):
-            s = dots[n] * scale
-            if cutlass.const_expr(n < MAX_BLOCKS):
-                s = cutlass.select_(n < nb, s, -Float32.inf)
-            scores.append(s)
-            top = cutlass.max(top, s)
-        total = Float32(0.0)
-        exps = []
-        for n in cutlass.range_constexpr(states):
-            exps.append(cute.math.exp(scores[n] - top))
-            total = total + exps[n]
-        probs = [exps[n] / total for n in range(states)]
-        y = cute.make_rmem_tensor((per,), Float32)
-        ss = Float32(0.0)
-        for r in cutlass.range_constexpr(per):
-            acc = Float32(0.0)
-            for n in cutlass.range_constexpr(states):
-                acc = acc + probs[n] * x[n, r]
-            y[r] = acc
-            ss = ss + acc * acc
-        ss = self.cta_sum(p, [ss], 2, warp, lane)[0]
-        rinv = cute.math.rsqrt(ss * inv_h + Float32(self.rms_eps))
-        for r in cutlass.range_constexpr(per):
-            k = r * COMPUTE_THREADS + tid
-            p.xs[0, k] = BFloat16(Float32(p.post_norm[k]) * (y[r] * rinv))
-        self.csync.sync()
 
     @cute.jit
     def fetch_act(self, p: MlpParams, slot, abuf, epoch, tid):
@@ -533,13 +433,15 @@ class InklingMlpKernel(WarpSpecialized):
     # ----------------------------------------------------------------- kernel
 
     @cute.kernel
-    def kernel(self, tma, gtensors, scratch, tensors, blocks, bound, num_blocks):
+    def kernel(self, tma, gtensors, gate_tma, gate_g, scratch, tensors, blocks, bound, num_blocks):
         layouts = {
             "W": cute.make_layout((ROWS, TILE_K, self.stages), stride=(TILE_K, 1, ROWS * TILE_K)),
             "X": cute.make_layout((3, self.hidden), stride=(self.hidden, 1)),
             "RED": cute.make_layout(
-                (REDUCTIONS, COMPUTE_WARPS, 8), stride=(COMPUTE_WARPS * 8, 8, 1)
+                (REDUCTIONS, COMPUTE_WARPS, RED_VALUES),
+                stride=(COMPUTE_WARPS * RED_VALUES, RED_VALUES, 1),
             ),
+            "MIX": cute.make_layout((MIX_FLOATS,)),
             "ROUTE": cute.make_layout((2, 2 * self.top_k), stride=(2 * self.top_k, 1)),
         }
         self.begin_roles(work=bound, layouts=layouts)
@@ -565,13 +467,35 @@ class InklingMlpKernel(WarpSpecialized):
                     cute.group_modes(tiles, 0, 2),
                 )
             )
+        gate = None
+        if cutlass.const_expr(self.messages):
+            gate_parts = [
+                cpasync.tma_partition(
+                    atom,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sW, 0, 2),
+                    cute.group_modes(cute.local_tile(g, (ROWS, TILE_K), (None, None)), 0, 2),
+                )
+                for atom, g in zip(gate_tma, gate_g)
+            ]
+            gate = GateParams(
+                tma=tuple(gate_tma),
+                gmem=tuple(part[1] for part in gate_parts),
+                h_part=tagged.pop("h_part"),
+                gated=tagged.pop("gated"),
+                mhalf=tensors["mhalf"],
+                messages=tensors["messages"],
+            )
         params = MlpParams(
             tma=tuple(tma),
             gmem=tuple(part[1] for part in parts),
             sW=StageView(parts[0][0], axis=1),
             xs=self.buffer("X"),
             red=self.buffer("RED"),
+            mix=self.buffer("MIX"),
             route=self.buffer("ROUTE"),
+            gate=gate,
             blocks=blocks,
             num_blocks=num_blocks,
             **tagged,
@@ -587,8 +511,12 @@ class InklingMlpKernel(WarpSpecialized):
         w2: cute.Tensor,
         router_bias: cute.Tensor,
         query: cute.Tensor,
-        post_norm: cute.Tensor,
+        norms: cute.Tensor,
         conv: cute.Tensor,
+        gate_down: cute.Tensor,
+        gate_fg: cute.Tensor,
+        mhalf: cute.Tensor,
+        messages: cute.Tensor,
         residual: cute.Tensor,
         block0: cute.Tensor,
         block1: cute.Tensor,
@@ -619,12 +547,18 @@ class InklingMlpKernel(WarpSpecialized):
             cpasync.make_tiled_tma_atom(op, src, smem, (ROWS, TILE_K))
             for src in (router, gate_up, down)
         ]
+        gate_pairs = []
+        if cutlass.const_expr(self.messages):
+            gate_pairs = gate_atoms(gate_down, gate_fg, self.hidden)
         bound = self.work.bind(table, workspace, max_ctas)
-        tensors = (state, pos, residual, query, post_norm, conv, router_bias, ring, out)
+        tensors = (state, pos, residual, query, norms, conv, router_bias, ring, mhalf, messages,
+                   out)  # fmt: skip
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             tuple(a for a, _ in pairs),
             tuple(g for _, g in pairs),
+            tuple(a for a, _ in gate_pairs),
+            tuple(g for _, g in gate_pairs),
             scratch,
             tensors,
             (block0, block1, block2, block3),
@@ -646,14 +580,15 @@ def compile_mlp_kernel(op: InklingMlpKernel):
         make_fake_compact_tensor(bf16, (e, 2 * width, h)),
         make_fake_compact_tensor(bf16, (e, h, width)),
         make_fake_compact_tensor(f32, (e,), assumed_align=4),
-        make_fake_compact_tensor(f32, (h,), assumed_align=4),  # block-residual query
-        make_fake_compact_tensor(bf16, (h,), assumed_align=2),  # post norm
+        make_fake_compact_tensor(f32, (1, h), assumed_align=4),  # block-residual query
+        make_fake_compact_tensor(bf16, (1, h), assumed_align=2),  # post norm
         make_fake_compact_tensor(f32, (h, op.conv_kernel), assumed_align=4),
+        *fake_gate_args(h),
         make_fake_compact_tensor(f32, (h,), assumed_align=4),  # residual
         *vector,
         Int32(1),
         make_fake_compact_tensor(bf16, (RING, h), assumed_align=2),
-        make_fake_compact_tensor(Int64, (1,), assumed_align=8),
+        make_fake_compact_tensor(Int32, (1,), assumed_align=4),  # pos
         make_fake_compact_tensor(bf16, (h,), assumed_align=2),
         make_fake_compact_tensor(Int64, (op.scratch_size,)),
         make_fake_compact_tensor(Int32, (2,), assumed_align=4),

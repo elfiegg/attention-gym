@@ -146,20 +146,26 @@ def clone(cache: ref.InklingCache) -> ref.InklingCache:
     return ref.InklingCache(**{k: v.clone() for k, v in vars(cache).items()})
 
 
-def check_visit(runner, config, w, layer, visit, h, blocks, cache, positions):
+def check_visit(
+    runner, config, w, layer, visit, h, blocks, cache, positions, messages=None, gates=None
+):
     """One launch against ``ref.attention_block`` (``start=None``) on a copy of ``cache``:
     the residual and the attention ring row within ``MAX_ULPS``, the k/v cache and ring rows
-    within theirs, every other row untouched. Returns the residual's error (``ulps`` of the
-    post-attention output)."""
+    within theirs, every other row untouched. A visit with ``messages`` (the oracle's
+    ``(1, 4, hidden)``) launches with the matching ``gates`` (``megakernel.GateArgs``).
+    Returns the residual's error (``ulps`` of the post-attention output)."""
     theirs = clone(cache)
     expected, expected_blocks = ref.attention_block(
-        config, w, layer, visit, h, blocks, None, theirs, positions, None, FAST
+        config, w, layer, visit, h, blocks, messages, theirs, positions, None, FAST
     )
-    residual, out_blocks = runner.attention_block(
-        config, w, layer, visit, h, blocks, None, cache, positions, None, FAST
-    )
-    assert len(out_blocks) == len(expected_blocks)
-    assert all(a is b for a, b in zip(out_blocks, expected_blocks))
+    if gates is None:
+        residual, out_blocks = runner.attention_block(
+            config, w, layer, visit, h, blocks, None, cache, positions, None, FAST
+        )
+        assert len(out_blocks) == len(expected_blocks)
+        assert all(a is b for a, b in zip(out_blocks, expected_blocks))
+    else:
+        residual = runner(w, layer, visit, h, blocks, cache, positions, gates=gates)[None]
     boundary = layer % config.block_layers == 0
     attn_out = expected[0] if boundary else expected[0] - h[0].float()
     errors = ulps(residual[0] - expected[0] + attn_out, attn_out)
