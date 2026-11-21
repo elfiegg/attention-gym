@@ -186,10 +186,10 @@ def check_visit(runner, config, w, layer, visit, h, blocks, cache, positions):
 CASES = [
     # (layer, blocks, positions): sliding layer 0 (no query, a block boundary), a sliding
     # layer inside a block, a sliding boundary layer with a query, full layers.
-    (0, 0, (1, 63, 64, 1100)),
+    (0, 0, (0, 1, 63, 64, 1100)),
     (1, 1, (1, 63, 64, 1100)),
     (6, 2, (65, 1100)),
-    (5, 1, (1, 63, 64, 1100)),
+    (5, 1, (0, 1, 63, 64, 1100)),
     (23, 4, (130, 1100)),
 ]
 
@@ -197,9 +197,9 @@ CASES = [
 @pytest.mark.parametrize("layer,blocks,positions", CASES)
 @torch.no_grad()
 def test_attention_block_random_weights(layer, blocks, positions):
-    """Positions before the convolution history fills, at and across a KV block edge, and past
-    the sliding window (1100 keys: sliding layers must read only the last 1024); several
-    launches through one runner (the epoch advances)."""
+    """Position 0 (only the new token and the sink), positions before the convolution history
+    fills, at and across a KV block edge, and past the sliding window (1100 keys: sliding
+    layers must read only the last 1024); several launches through one runner (the epoch advances)."""
     require_sm100()
     w = random_layer(CONFIG, layer, seed=layer)
     runner = InklingAttnMegakernel(CONFIG, (w,))
@@ -226,8 +226,9 @@ def test_full_layer_log_scaling():
 
 @torch.no_grad()
 def test_graph_replay_and_compile_reuse():
-    """The launch replays bit-identically inside a CUDA graph, and positions, block counts and
-    cache capacities are runtime values: varying them compiles nothing."""
+    """The launch replays bit-identically to eager launches inside a CUDA graph, at device
+    positions that change the KV splits, and positions, block counts and cache capacities are
+    runtime values: varying them compiles nothing."""
     require_sm100()
     w = random_layer(CONFIG, 1, seed=1)
     runner = InklingAttnMegakernel(CONFIG, (w,))
@@ -236,31 +237,33 @@ def test_graph_replay_and_compile_reuse():
     h, states = random_inputs(CONFIG, 1, seed=2)
     positions = torch.tensor([1030], device="cuda")
     out = torch.empty(CONFIG.hidden_size, device="cuda")
-    eager = runner(w, 1, 0, h, states, cache, positions).clone()
-    eager_cache = clone(cache)
+    runner(w, 1, 0, h, states, cache, positions, out)
     entries = compile_attn_kernel.cache_info().currsize
 
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         runner(w, 1, 0, h, states, cache, positions, out)  # warm up on the capture stream
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, stream=stream):
             runner(w, 1, 0, h, states, cache, positions, out)
     torch.cuda.current_stream().wait_stream(stream)
-    for _ in range(3):
+    for pos in (1030, 70, 1030):
+        positions.fill_(pos)
+        expected_cache = clone(initial)
+        expected = runner(w, 1, 0, h, states, expected_cache, positions).clone()
         for name, tensor in vars(cache).items():
             tensor.copy_(getattr(initial, name))
         out.zero_()
         graph.replay()
-        assert torch.equal(out, eager)
+        assert torch.equal(out, expected), pos
         for name, tensor in vars(cache).items():
-            assert torch.equal(tensor, getattr(eager_cache, name)), name
+            assert torch.equal(tensor, getattr(expected_cache, name)), (pos, name)
 
     before = compile_attn_kernel.cache_info()
     other = random_cache(CONFIG, visits=1, max_len=2048, seed=3)
-    for pos, blocks, target in [(1, 0, cache), (64, 4, cache), (2000, 2, other), (1100, 3, other)]:
+    for pos, blocks, target in [(0, 0, cache), (64, 4, cache), (2000, 2, other), (1100, 3, other)]:
         positions.fill_(pos)
-        graph.replay()
         h, states = random_inputs(CONFIG, blocks, seed=pos)
         runner(w, 1, 0, h, states, target, positions)
     info = compile_attn_kernel.cache_info()
@@ -270,10 +273,18 @@ def test_graph_replay_and_compile_reuse():
 
 
 def checkpoint_weights():
+    """The checkpoint's text decoder from a complete local snapshot; skips otherwise (never
+    downloads)."""
     hub = pytest.importorskip("huggingface_hub")
-    if not isinstance(hub.try_to_load_from_cache(MODEL, "config.json"), str):
-        pytest.skip(f"{MODEL} is not in the local HF cache")
-    return ref.load_inkling_weights(MODEL)
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    try:
+        path = hub.snapshot_download(
+            MODEL, allow_patterns=["*.json", "model*.safetensors"], local_files_only=True
+        )
+    except LocalEntryNotFoundError as error:
+        pytest.skip(f"{MODEL} is not in the local HF cache: {error}")
+    return ref.load_inkling_weights(path)
 
 
 @pytest.mark.xdist_group("inkling-checkpoint")
