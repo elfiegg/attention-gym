@@ -9,7 +9,9 @@ position with the inputs a real megakernel step produced there, rewriting the sa
 (a fixed-position, reused-buffer workload: weights larger than L2 stream from DRAM, the caches
 and activations may stay in L2). A launch graph replays ``reps`` calls of one launch of the
 step back to back and reports the time per call; the breakdown multiplies each kind's time by
-its launches per step, and the rest of the measured step is the gaps between launches. Graphs
+its launches per step, and the rest of the measured step is the gaps between launches, plus
+whatever a repeated launch gains over its first run inside a step (an attention layer's ~54 MB
+of weights may stay partly in L2 across repeats despite evict-first loads). Graphs
 are timed in ``rounds`` interleaved rounds (rotating order) and each row reports the median of
 the round medians. Default DVFS.
 """

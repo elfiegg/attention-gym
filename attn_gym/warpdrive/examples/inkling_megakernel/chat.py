@@ -8,8 +8,9 @@ Backends:
 - ``reference``: the oracle, one eager step at a time (a host sync per step: no CUDA graph);
 - ``torch``: ``fast.decode_step`` (the oracle's dataflow on capturable kernels) in CUDA graphs;
 - ``compile``: the same step under torch.compile (minutes to compile cold), in CUDA graphs;
-- ``megakernel``: the step as warpdrive megakernel launches only (``megakernel.InklingDecoder``:
-  two per visit, one per core pass's messages, one for the LM head), in CUDA graphs.
+- ``megakernel`` (default): the step as warpdrive megakernel launches only
+  (``megakernel.InklingDecoder``: two per visit, one per core pass's messages, one for the LM
+  head), in CUDA graphs. It needs an SM100-family GPU and CuTeDSL; elsewhere use ``torch``.
 
 Replies are sequences of ``<|message_model|><|content_X|>...<|end_message|>`` parts, ``X`` being
 ``thinking`` or ``text``, closed by ``<|content_model_end_sampling|>``; the reply shows thinking
