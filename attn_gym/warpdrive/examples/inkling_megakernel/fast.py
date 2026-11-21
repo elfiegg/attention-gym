@@ -61,10 +61,15 @@ FAST = Kernels(short_conv=short_conv, experts=grouped_experts)
 
 
 def decode_step(
-    weights: InklingWeights, token: torch.Tensor, pos: torch.Tensor, cache: InklingCache
+    weights: InklingWeights,
+    token: torch.Tensor,
+    pos: torch.Tensor,
+    cache: InklingCache,
+    kernels: Kernels = FAST,
 ) -> torch.Tensor:
     """One decode step of the one-element ``token`` at the one-element device position ``pos``;
-    writes the caches there and returns fp32 logits ``(vocab,)``. No host sync."""
+    writes the caches there and returns fp32 logits ``(vocab,)``. No host sync as long as
+    ``kernels`` sync nothing (``FAST``'s do not)."""
     positions = pos.reshape(1).long()
-    h = hidden_states(weights, token.reshape(1), positions, cache, cache.max_len, FAST)
+    h = hidden_states(weights, token.reshape(1), positions, cache, cache.max_len, kernels)
     return logits_of(weights, h)[0]
