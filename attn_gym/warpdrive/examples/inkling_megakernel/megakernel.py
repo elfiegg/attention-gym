@@ -291,7 +291,8 @@ class InklingMlpMegakernel:
 class AttnLayer:
     """A layer's attention arguments in the kernel's form: per-stream block-residual queries
     and norm weights (one stream in sliding layers, three in full ones), the dynamic tap
-    projections (placeholders in sliding layers, which read none) and the k/v taps."""
+    projections (placeholders in sliding layers, which read none), the k/v taps and the
+    relative-bias projection transposed (a row per distance)."""
 
     query: torch.Tensor  # (streams, hidden) fp32; zeros (unread) at layer 0
     norms: torch.Tensor  # (streams, hidden) bf16
@@ -299,6 +300,7 @@ class AttnLayer:
     v_dynamic: torch.Tensor
     k_taps: torch.Tensor  # sliding: (kv_dim, kernel) fp32; full: (kernel, kv_dim) bf16
     v_taps: torch.Tensor
+    rel_proj: torch.Tensor  # (rel_extent, d_rel) bf16
 
     @classmethod
     def of(cls, config: InklingConfig, w: LayerWeights) -> "AttnLayer":
@@ -310,6 +312,7 @@ class AttnLayer:
                 v_dynamic=w.v_dynamic,
                 k_taps=w.k_static.contiguous(),
                 v_taps=w.v_static.contiguous(),
+                rel_proj=w.rel_proj.T.contiguous(),
             )
         query = w.attn_query
         if query is None:
@@ -322,6 +325,7 @@ class AttnLayer:
             v_dynamic=placeholder,
             k_taps=w.k_conv.contiguous(),
             v_taps=w.v_conv.contiguous(),
+            rel_proj=w.rel_proj.T.contiguous(),
         )
 
 
@@ -411,7 +415,7 @@ class InklingAttnMegakernel:
             args.norms,
             w.q_scale,
             w.rel_scale,
-            w.rel_proj,
+            args.rel_proj,
             args.k_taps,
             args.v_taps,
             w.attn_conv,

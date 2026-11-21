@@ -131,7 +131,7 @@ class AttnParams:
     norms: cute.Tensor  # (streams, hidden) bf16 input RMSNorm weights
     q_scale: cute.Tensor  # (q_heads, HEAD_DIM) bf16
     rel_scale: cute.Tensor  # (q_heads, d_rel) bf16
-    rel_proj: cute.Tensor  # (d_rel, rel_width) bf16
+    rel_proj: cute.Tensor  # (rel_width, d_rel) bf16: ref's rel_proj transposed, a row per distance
     k_taps: cute.Tensor  # sliding: (kv_dim, kernel) fp32; full: (kernel, kv_dim) bf16 static
     v_taps: cute.Tensor
     attn_conv: cute.Tensor  # (hidden, kernel) fp32 post-attention taps
@@ -453,6 +453,7 @@ class InklingAttnKernel(WarpSpecialized):
         states = MAX_BLOCKS + 1
         nq = self.streams
         nb = p.num_blocks
+        # Every load first, so their latencies overlap: the states, queries and norm weights.
         x = cute.make_rmem_tensor((states, per), Float32)
         x.fill(0.0)
         for n in cutlass.range_constexpr(MAX_BLOCKS):
@@ -461,6 +462,12 @@ class InklingAttnKernel(WarpSpecialized):
                     x[n, r] = Float32(p.blocks[n][r * COMPUTE_THREADS + tid])
         for r in cutlass.range_constexpr(per):
             x[MAX_BLOCKS, r] = Float32(p.h[r * COMPUTE_THREADS + tid])
+        query = cute.make_rmem_tensor((nq, per), Float32)
+        norms = cute.make_rmem_tensor((nq, per), BFloat16)
+        for q in cutlass.range_constexpr(nq):
+            for r in cutlass.range_constexpr(per):
+                query[q, r] = p.query[q, r * COMPUTE_THREADS + tid]
+                norms[q, r] = p.norms[q, r * COMPUTE_THREADS + tid]
         inv_h = fp32_reciprocal(h)
         y = cute.make_rmem_tensor((nq, per), Float32)
         if p.queries == 0:
@@ -485,7 +492,7 @@ class InklingAttnKernel(WarpSpecialized):
                 for n in cutlass.range_constexpr(states):
                     dot = Float32(0.0)
                     for r in cutlass.range_constexpr(per):
-                        dot = dot + p.query[q, r * COMPUTE_THREADS + tid] * x[n, r]
+                        dot = dot + query[q, r] * x[n, r]
                     dots.append(dot)
             dots = self.cta_sum(p, dots, 1, warp, lane)
             scale = fp32(h**-0.5)
@@ -519,7 +526,7 @@ class InklingAttnKernel(WarpSpecialized):
             rinv = cute.math.rsqrt(squares[q] * inv_h + Float32(self.rms_eps))
             for r in cutlass.range_constexpr(per):
                 k = r * COMPUTE_THREADS + tid
-                p.xs[q, k] = BFloat16(Float32(p.norms[q, k]) * (y[q, r] * rinv))
+                p.xs[q, k] = BFloat16(Float32(norms[q, r]) * (y[q, r] * rinv))
         self.csync.sync()
 
     @cute.jit
@@ -565,11 +572,49 @@ class InklingAttnKernel(WarpSpecialized):
         return column
 
     @cute.jit
-    def prepare_heads(self, p: AttnParams, hq, kvh, pos, writer, epoch, tid, warp, lane):
+    def distances(self, pos, blk0, blk1, newest):
+        """``(first, last)``: the distances ``pos - key`` with a relative bias that the split's
+        keys (and the new token, at distance 0, in the newest split) can have."""
+        first = cutlass.max(pos - blk1 * BLOCK + 1, Int32(0))
+        first = cutlass.select_(newest, Int32(0), first)
+        last = cutlass.min(pos - blk0 * BLOCK, Int32(self.extent - 1))
+        return first, last
+
+    @cute.jit
+    def prepare_heads(
+        self, p: AttnParams, hq, kvh, pos, writer, first, last, epoch, tid, warp, lane
+    ):
         """Fetch the item's projections into QKVS, then in place (one warp each): the q head's
         scale, L2 clip (and log scaling), the kv head's k and v convolutions (writing their
         ring rows when ``writer``), k's L2 clip and v's RMS norm, and the relative state's
-        scale and clip (and log scaling). Every value is rounded to bf16 as the oracle's."""
+        scale and clip (and log scaling). Then every thread builds the relative bias of
+        distances ``[first, last]`` in BIAS (``score``). Every value is rounded to bf16 as the
+        oracle's.
+
+        The weights, ring rows and ``rel_proj`` rows each thread needs load before the poll and
+        are used after it, so their latency overlaps the wait for QKV (this launch writes ring
+        row ``pos`` only, after reading the earlier ones)."""
+        kernel, r = self.conv_kernel, self.d_rel
+        rounds = -(-self.extent // COMPUTE_THREADS)
+        d0 = 4 * lane  # warps 0-2: this lane's 4 dims of the head
+        scales = cute.make_rmem_tensor((4,), BFloat16)
+        taps = cute.make_rmem_tensor((4, kernel), p.k_taps.element_type)
+        past = cute.make_rmem_tensor((4, kernel - 1), BFloat16)
+        rel_proj = cute.make_rmem_tensor((rounds, r), BFloat16)
+        if warp == 0:
+            for e in cutlass.range_constexpr(4):
+                scales[e] = p.q_scale[hq, d0 + e]
+        elif warp == 1:
+            self.load_conv(p.ring_k, p.k_taps, kvh, pos, lane, taps, past)
+        elif warp == 2:
+            self.load_conv(p.ring_v, p.v_taps, kvh, pos, lane, taps, past)
+        elif warp == 3:
+            if lane < r:
+                scales[0] = p.rel_scale[hq, lane]
+        for i in cutlass.range_constexpr(rounds):
+            d = first + i * COMPUTE_THREADS + tid
+            if d <= last:
+                cute.autovec_copy(p.rel_proj[d, None], rel_proj[i, None])
         words = self.qkvs_words
         # Thread t fetches words 2t, 2t + 1; threads past them refetch the last pair.
         word = cutlass.min(2 * tid, words - 2)
@@ -582,12 +627,11 @@ class InklingAttnKernel(WarpSpecialized):
         ls = Float32(1.0)
         if cutlass.const_expr(self.full):
             ls = self.log_scale(pos)
-        d0 = 4 * lane  # warps 0-2: this lane's 4 dims of the head
         if warp == 0:
             x = cute.make_rmem_tensor((4,), Float32)
             ss = Float32(0.0)
             for e in cutlass.range_constexpr(4):
-                x[e] = p.qkvs[d0 + e] * Float32(p.q_scale[hq, d0 + e])
+                x[e] = p.qkvs[d0 + e] * Float32(scales[e])
                 ss = ss + x[e] * x[e]
             factor = clip_factor(group_sum(ss, 32), self.qk_clip)
             for e in cutlass.range_constexpr(4):
@@ -596,57 +640,83 @@ class InklingAttnKernel(WarpSpecialized):
                     v = bf16_round(v * ls)
                 p.qkvs[d0 + e] = v
         elif warp == 1:
-            self.conv_head(p, p.ring_k, p.k_taps, HEAD_DIM, 3 * HEAD_DIM + self.d_rel, kvh,
-                           pos, writer, lane, True)  # fmt: skip
+            self.conv_head(p, p.ring_k, HEAD_DIM, 3 * HEAD_DIM + r, kvh, pos, writer, lane,
+                           taps, past, True)  # fmt: skip
         elif warp == 2:
-            dyn = 3 * HEAD_DIM + self.d_rel + self.conv_kernel
-            self.conv_head(p, p.ring_v, p.v_taps, 2 * HEAD_DIM, dyn, kvh, pos, writer, lane,
-                           False)  # fmt: skip
+            self.conv_head(p, p.ring_v, 2 * HEAD_DIM, 3 * HEAD_DIM + r + kernel, kvh, pos,
+                           writer, lane, taps, past, False)  # fmt: skip
         elif warp == 3:
             x = Float32(0.0)
-            if lane < self.d_rel:
-                x = p.qkvs[3 * HEAD_DIM + lane] * Float32(p.rel_scale[hq, lane])
+            if lane < r:
+                x = p.qkvs[3 * HEAD_DIM + lane] * Float32(scales[0])
             factor = clip_factor(group_sum(x * x, 32), self.rel_clip)
             v = bf16_round(x * factor)
             if cutlass.const_expr(self.full):
                 v = bf16_round(v * ls)
-            if lane < self.d_rel:
+            if lane < r:
                 p.qkvs[3 * HEAD_DIM + lane] = v
         self.csync.sync()
+        rel = cute.make_rmem_tensor((r,), Float32)
+        for k in cutlass.range_constexpr(r):
+            rel[k] = p.qkvs[3 * HEAD_DIM + k]
+        bias = self.bias_table(p)
+        for i in cutlass.range_constexpr(rounds):
+            d = first + i * COMPUTE_THREADS + tid
+            if d <= last:
+                acc = Float32(0.0)
+                for k in cutlass.range_constexpr(r):
+                    acc = acc + rel[k] * Float32(rel_proj[i, k])
+                bias[d] = BFloat16(acc)
+        self.csync.sync()
+
+    def bias_table(self, p: AttnParams):
+        """BIAS: the bf16 relative bias by distance (``extent`` entries). It reuses the first
+        o_proj input row of X: every CTA runs its ATTN rows before its OPROJ rows."""
+        return p.xs[self.streams, None]
 
     @cute.jit
-    def conv_head(self, p: AttnParams, ring, taps, base, dyn, kvh, pos, writer, lane,
+    def load_conv(self, ring, taps, kvh, pos, lane, tap, past):
+        """One lane's 4 channels of convolution taps (``conv_head``'s layout) and ring rows
+        ``pos - 1 - t`` (``past[:, t]``; rows before position 0 are read but unused)."""
+        kernel = self.conv_kernel
+        for e in cutlass.range_constexpr(4):
+            c = kvh * HEAD_DIM + 4 * lane + e
+            for t in cutlass.range_constexpr(kernel):
+                if cutlass.const_expr(self.full):
+                    tap[e, t] = taps[t, c]
+                else:
+                    tap[e, t] = taps[c, t]
+            for t in cutlass.range_constexpr(kernel - 1):
+                past[e, t] = ring[(pos - 1 - t + RING) % RING, c]
+
+    @cute.jit
+    def conv_head(self, p: AttnParams, ring, base, dyn, kvh, pos, writer, lane, tap, past,
                   is_key: cutlass.Constexpr):  # fmt: skip
         """One warp: the k (``is_key``: then L2 clip) or v (then unweighted RMS norm) head at
-        QKVS ``base`` through its short convolution over the visit's ring, lane l on dims
-        4l .. 4l + 3. Sliding layers: ``ref.short_conv`` with static (channel, kernel) taps, the
-        last on the current token. Full layers: ``ref.dynamic_conv``, tap t (t back) is the
-        static (kernel, channel) weight plus the head's dynamic tap at QKVS ``dyn + t``."""
+        QKVS ``base`` through its short convolution, lane l on dims 4l .. 4l + 3, from
+        ``load_conv``'s taps and ring rows. Sliding layers: ``ref.short_conv`` with static
+        (channel, kernel) taps, the last on the current token. Full layers:
+        ``ref.dynamic_conv``, tap t (t back) is the static (kernel, channel) weight plus the
+        head's dynamic tap at QKVS ``dyn + t``."""
         taps_n = self.conv_kernel
         z = cute.make_rmem_tensor((4,), Float32)
         ss = Float32(0.0)
         for e in cutlass.range_constexpr(4):
-            c = kvh * HEAD_DIM + 4 * lane + e
             y = p.qkvs[base + 4 * lane + e]
+            hist = [y]  # hist[t]: the input t positions back, zero before position 0
+            for t in cutlass.range_constexpr(1, taps_n):
+                hist.append(cutlass.select_(pos - t >= 0, Float32(past[e, t - 1]), Float32(0.0)))
             conv = Float32(0.0)
             if cutlass.const_expr(self.full):
                 for t in cutlass.range_constexpr(taps_n):
-                    hist = y
-                    if cutlass.const_expr(t > 0):
-                        src = pos - t
-                        past = Float32(ring[(src + RING) % RING, c])
-                        hist = cutlass.select_(src >= 0, past, Float32(0.0))
-                    conv = conv + hist * (Float32(taps[t, c]) + p.qkvs[dyn + t])
+                    conv = conv + hist[t] * (Float32(tap[e, t]) + p.qkvs[dyn + t])
                 out = bf16_round((conv + y) * fp32_reciprocal(math.sqrt(2 * taps_n + 1)))
             else:
-                for t in cutlass.range_constexpr(taps_n - 1):
-                    src = pos - (taps_n - 1) + t  # >= -(taps - 1): positions before 0 read zero
-                    past = Float32(ring[(src + RING) % RING, c])
-                    conv = conv + taps[c, t] * cutlass.select_(src >= 0, past, Float32(0.0))
-                conv = conv + taps[c, taps_n - 1] * y
+                for t in cutlass.range_constexpr(taps_n):
+                    conv = conv + tap[e, t] * hist[taps_n - 1 - t]
                 out = bf16_round((conv + y) * fp32_reciprocal(math.sqrt(taps_n + 1)))
             if writer:
-                ring[pos % RING, c] = BFloat16(y)
+                ring[pos % RING, kvh * HEAD_DIM + 4 * lane + e] = BFloat16(y)
             z[e] = out
             ss = ss + out * out
         ss = group_sum(ss, 32)
@@ -658,18 +728,13 @@ class InklingAttnKernel(WarpSpecialized):
             p.qkvs[base + 4 * lane + e] = bf16_round(z[e] * factor)
 
     @cute.jit
-    def score(self, p: AttnParams, dot, distance, rel, j):
+    def score(self, p: AttnParams, dot, distance):
         """A key's softmax logit in log2 units from its 8 lanes' partial q.k ``dot``: the bf16
-        score plus the relative bias ``bf16(rel . rel_proj[:, distance])`` (zero at distances
-        past the extent), rounded to bf16 as ``ref.attention``. Lane j of the 8 holds
-        ``rel`` entries ``j * len(rel) ..``."""
-        n = len(rel)
-        col = cutlass.min(cutlass.max(distance, Int32(0)), Int32(self.extent - 1))
-        rb = Float32(0.0)
-        for i in cutlass.range_constexpr(n):
-            rb = rb + rel[i] * Float32(p.rel_proj[j * n + i, col])
-        rb = group_sum(rb, 8)
-        bias = cutlass.select_(distance < self.extent, bf16_round(rb), Float32(0.0))
+        score plus the relative bias at ``distance`` (BIAS; zero past the extent), rounded to
+        bf16 as ``ref.attention``."""
+        index = cutlass.min(cutlass.max(distance, Int32(0)), Int32(self.extent - 1))
+        bias = Float32(self.bias_table(p)[index])
+        bias = cutlass.select_(distance < self.extent, bias, Float32(0.0))
         s = bf16_round(bf16_round(group_sum(dot, 8)) * fp32(HEAD_DIM**-0.5))
         return bf16_round(s + bias) * LOG2E
 
@@ -688,13 +753,10 @@ class InklingAttnKernel(WarpSpecialized):
         blk0, blk1, newest = self.split_blocks(pos, split)
         is_newest = split == newest
         writer = is_newest & (hq % self.group == 0)  # one item per kv head
+        first, last = self.distances(pos, blk0, blk1, is_newest)
         with self.trace_region("attn.prepare", payload=item):
-            self.prepare_heads(p, hq, kvh, pos, writer, epoch, tid, warp, lane)
+            self.prepare_heads(p, hq, kvh, pos, writer, first, last, epoch, tid, warp, lane)
         q = head_vec(p.qkvs, 0, d0)
-        rel = []
-        per = self.d_rel // 8
-        for i in cutlass.range_constexpr(per):
-            rel.append(p.qkvs[3 * HEAD_DIM + j * per + i])
         lo = Int32(0)
         if cutlass.const_expr(not self.full):
             lo = pos - (self.window - 1)
@@ -714,7 +776,7 @@ class InklingAttnKernel(WarpSpecialized):
                         dot = Float32(0.0)
                         for e in cutlass.range_constexpr(16):
                             dot = dot + q[e] * kv[e]
-                        s = self.score(p, dot, pos - kp, rel, j)
+                        s = self.score(p, dot, pos - kp)
                         sc[i] = cutlass.select_((kp < pos) & (kp >= lo), s, -Float32.inf)
                 bm = cutlass.max(sc[0], sc[1])
                 bm = cutlass.max(bm, cute.arch.shuffle_sync_bfly(bm, offset=8))
@@ -765,7 +827,7 @@ class InklingAttnKernel(WarpSpecialized):
                 dot = Float32(0.0)
                 for e in cutlass.range_constexpr(16):
                     dot = dot + q[e] * k_new[e]
-                s = self.score(p, dot, Int32(0), rel, j)
+                s = self.score(p, dot, Int32(0))
                 if g == 0:
                     for e in cutlass.range_constexpr(8):
                         att[COMPUTE_WARPS, d0 + e] = v_new[e]
@@ -857,6 +919,15 @@ class InklingAttnKernel(WarpSpecialized):
         of the splits' partials in split order), written to the convolution ring at the
         position, then the post-attention convolution ``(conv + y) / sqrt(kernel + 1)`` (bf16)
         plus ``h`` (unless the layer starts a block)."""
+        taps = self.conv_kernel
+        # The weights, ring rows and input load before the poll (their latency overlaps it).
+        weights = cute.make_rmem_tensor((taps,), Float32)
+        past = cute.make_rmem_tensor((taps - 1,), BFloat16)
+        for j in cutlass.range_constexpr(taps):
+            weights[j] = p.attn_conv[col, j]
+        for j in cutlass.range_constexpr(taps - 1):
+            past[j] = p.ring_attn[(pos - (taps - 1) + j + RING) % RING, col]
+        h = p.h[col]
         vals = cute.make_rmem_tensor((O_SPLITS,), Float32)
         fetch([(p.o_part, s * self.hidden + col, 1) for s in range(O_SPLITS)], vals, epoch)
         acc = vals[0]
@@ -864,15 +935,13 @@ class InklingAttnKernel(WarpSpecialized):
             acc = acc + vals[s]
         y = bf16_round(acc)
         p.ring_attn[pos % RING, col] = BFloat16(y)
-        taps = self.conv_kernel
         conv = Float32(0.0)
         for j in cutlass.range_constexpr(taps - 1):
             src = pos - (taps - 1) + j  # >= -(taps - 1): positions before 0 read zero
-            past = Float32(p.ring_attn[(src + RING) % RING, col])
-            conv = conv + p.attn_conv[col, j] * cutlass.select_(src >= 0, past, Float32(0.0))
-        conv = conv + p.attn_conv[col, taps - 1] * y
+            conv = conv + weights[j] * cutlass.select_(src >= 0, Float32(past[j]), Float32(0.0))
+        conv = conv + weights[taps - 1] * y
         z = bf16_round((conv + y) * fp32_reciprocal(math.sqrt(taps + 1)))
-        residual = Float32(p.h[col]) + z
+        residual = Float32(h) + z
         p.out[col] = cutlass.select_(p.boundary != 0, z, residual)
 
     # ----------------------------------------------------------------- kernel
@@ -1044,7 +1113,7 @@ def compile_attn_kernel(op: InklingAttnKernel):
         make_fake_compact_tensor(bf16, (op.streams, h), assumed_align=2),  # norms
         make_fake_compact_tensor(bf16, (qh, HEAD_DIM), assumed_align=2),
         make_fake_compact_tensor(bf16, (qh, op.d_rel), assumed_align=2),
-        make_fake_compact_tensor(bf16, (op.d_rel, op.rel_width), assumed_align=2),
+        make_fake_compact_tensor(bf16, (op.rel_width, op.d_rel), assumed_align=16),
         make_fake_compact_tensor(tap_dtype, tap_shape, assumed_align=2),
         make_fake_compact_tensor(tap_dtype, tap_shape, assumed_align=2),
         make_fake_compact_tensor(f32, (h, op.conv_kernel), assumed_align=4),
