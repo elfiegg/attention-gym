@@ -288,8 +288,7 @@ class Launch:
             events = 32 * -(-self.table.shape[0] // self.max_ctas) + 64
             op = op.with_settings(trace_backend=trace, trace_events_per_role=events)
         self.op = op
-        size = getattr(op, "scratch_size", 1)
-        self.scratch = torch.zeros(size, device=device, dtype=torch.int64)
+        self.scratch = torch.zeros(op.scratch_size, device=device, dtype=torch.int64)
         self.state = torch.zeros(2, device=device, dtype=torch.int32)
         self.trace_buffer = torch.zeros(1, device=device, dtype=torch.int64)
 
@@ -702,6 +701,13 @@ class InklingDecoder:
 
     def __init__(self, weights: InklingWeights, device="cuda"):
         config = weights.config
+        blocks = config.block_layers
+        # A pass's messages read two states (the core's second block input and its output), and
+        # the final block residual reads every block: the kernels' layout.
+        if config.loop_start % blocks or config.loop_layers != 2 * blocks:
+            raise ValueError("the core must start a block and span exactly two blocks")
+        if config.num_layers > blocks * MAX_BLOCKS:
+            raise ValueError(f"the kernels' block residuals read at most {MAX_BLOCKS} blocks")
         self.weights, self.config = weights, config
         self.gates = MessageGates(
             weights.layers[config.loop_start : config.loop_end], weights.message_queries

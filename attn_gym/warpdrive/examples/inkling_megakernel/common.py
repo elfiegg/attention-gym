@@ -17,8 +17,8 @@ inputs (``gather``) before their first item of the launch's own.
 
 Sized so that a launch's message items (126 in attention, 42 in the MLP) fit one per CTA:
 every GATEMIX item then waits for the last MSGDOWN item, not for another GATEMIX item of its CTA.
-On GB300 at Inkling 2 Mini's shapes, 6 whole-K MSGDOWN tiles and 32-row GATEMIX items (two on
-some CTAs) put the gather ~9 us after the prologue.
+On GB300 at Inkling 2 Mini's shapes the gather of a sliding attention launch ends ~6.5 us after
+the prologue (whole-K MSGDOWN tiles and 32-row GATEMIX items, two on some CTAs: ~9 us).
 """
 
 import struct
@@ -163,17 +163,42 @@ class GateParams:
 
 class InklingKernel(WarpSpecialized):
     """Device helpers of the Inkling launches. Subclasses set ``hidden``, ``rms_eps``,
-    ``csync`` (the compute warps' barrier) and ``engine``; launches with message gates also set
-    ``messages`` (true), ``first_gate`` and ``gate_query`` (each gate's prologue query) and
-    implement ``partial``. Their params carry ``xs`` (GEMV inputs), ``red`` (``(REDUCTIONS,
+    ``csync`` (the compute warps' barrier) and ``engine``, and define ``scratch_shapes`` (tagged
+    words by buffer) when they publish any; launches with message gates call ``init_messages``
+    and implement ``partial``. Their params carry ``xs`` (GEMV inputs), ``red`` (``(REDUCTIONS,
     COMPUTE_WARPS, RED_VALUES)`` fp32), ``mix`` (``(MIX_FLOATS,)`` fp32), ``blocks``,
     ``num_blocks``, ``norms`` and ``gate`` (``GateParams`` or None)."""
 
     messages = False
 
+    def init_messages(self, messages: bool, first_gate: int, gate_query: tuple[int, ...]):
+        """Message gates ``first_gate ..`` (one per entry of ``gate_query``, the prologue query
+        whose block residual each gate's x is) when ``messages``."""
+        if messages and (
+            (self.hidden // TILE_K) % GATE_SPLITS or self.hidden % (ROWS * MIX_STAGES)
+        ):
+            raise ValueError(
+                f"message gates need hidden / {TILE_K} divisible by {GATE_SPLITS} and hidden "
+                f"divisible by {ROWS * MIX_STAGES}"
+            )
+        self.messages, self.first_gate, self.gate_query = messages, first_gate, gate_query
+
     @property
     def gates(self) -> int:
         return len(self.gate_query) if self.messages else 0
+
+    @property
+    def scratch_shapes(self) -> dict[str, int]:
+        """Tagged int64 words of each per-launch intermediate."""
+        return {}
+
+    @property
+    def scratch_offsets(self) -> dict[str, int]:
+        return scratch_offsets(self.scratch_shapes)[0]
+
+    @property
+    def scratch_size(self) -> int:
+        return scratch_offsets(self.scratch_shapes)[1]
 
     def gate_scratch_shapes(self) -> dict[str, int]:
         """Tagged words of the message items: MSGDOWN partials (split, gate, row) and the gated
@@ -201,8 +226,10 @@ class InklingKernel(WarpSpecialized):
     @cute.jit
     def cta_sum(self, p, vals, slot: cutlass.Constexpr, warp, lane):
         """Sums of each of ``vals`` (at most RED_VALUES per-thread values) over the compute
-        threads, in every thread; ``slot`` picks a RED region of its own, so no barrier guards
-        its reuse."""
+        threads, in every thread, through RED region ``slot``. Before a slot is written again,
+        every thread must pass a barrier after its last read: the prologue's reductions use
+        distinct slots, and later reuses follow the prologue's closing barrier or another
+        ``cta_sum`` of the same item."""
         n = len(vals)
         for i in cutlass.range_constexpr(n):
             v = group_sum(vals[i], 32)
@@ -347,6 +374,47 @@ class InklingKernel(WarpSpecialized):
         for g in cutlass.range_constexpr(1, self.gates):
             query = cutlass.select_(s == g, Int32(self.gate_query[g]), query)
         return query
+
+    @cute.jit
+    def gate_params(self, sW, tma, gtensors, tagged: dict, tensors: dict):
+        """The kernel's ``GateParams`` (None without messages): the gates' TMA partitions over
+        the weight stages ``sW``, their tagged buffers (popped from ``tagged``) and the
+        ``mhalf``/``messages`` argument tensors."""
+        if cutlass.const_expr(not self.messages):
+            return None
+        parts = [
+            cpasync.tma_partition(
+                atom,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sW, 0, 2),
+                cute.group_modes(cute.local_tile(g, (ROWS, TILE_K), (None, None)), 0, 2),
+            )
+            for atom, g in zip(tma, gtensors)
+        ]
+        return GateParams(
+            tma=tuple(tma),
+            gmem=tuple(part[1] for part in parts),
+            h_part=tagged.pop("h_part"),
+            gated=tagged.pop("gated"),
+            mhalf=tensors["mhalf"],
+            messages=tensors["messages"],
+        )
+
+    @cute.jit
+    def message_item(self, p, w, op, a, b, gathered, epoch, tid, warp, lane, item):
+        """The compute warps' part of a launch with messages for table row ``(op, a, b)``: a
+        MSGDOWN or GATEMIX item, or before the first row of the launch's own ops (``gathered``
+        still 0) the gather. Returns the weight ring's consumer and ``gathered``."""
+        if op == MSGDOWN:
+            w = self.msgdown(p, w, a, b, epoch, warp, lane)
+        elif op == GATEMIX:
+            w = self.gatemix(p, w, a, b, epoch, warp, lane)
+        elif gathered == 0:
+            with self.trace_region("gather", payload=item):
+                self.gather(p, epoch, tid, warp, lane)
+            gathered = Int32(1)
+        return w, gathered
 
     @cute.jit
     def load_gate_item(self, p, w, op, a, b):

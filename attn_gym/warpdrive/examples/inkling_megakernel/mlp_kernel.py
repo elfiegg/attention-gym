@@ -60,7 +60,6 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
-    GATEMIX,
     MAX_BLOCKS,
     MIX_FLOATS,
     MSGDOWN,
@@ -77,7 +76,6 @@ from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     fp32_reciprocal,
     gate_atoms,
     load_tiles,
-    scratch_offsets,
 )
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     COMPUTE_THREADS,
@@ -162,9 +160,7 @@ class InklingMlpKernel(InklingKernel):
         self.rms_eps = rms_eps
         self.gate_softcap, self.up_softcap = gate_softcap, up_softcap
         self.route_scale = route_scale
-        self.messages = messages
-        self.first_gate = 3  # the MLP gate
-        self.gate_query = (0,)
+        self.init_messages(messages, 3, (0,))  # the MLP gate
         self.hidden_k_tiles = hidden // TILE_K
         self.down_k_tiles = -(-width // TILE_K)  # the last stage's columns past width are zero
         self.gate_tiles = width // (ROWS // 2)  # gate/up tiles per slot: 16 (gate, up) pairs
@@ -199,14 +195,6 @@ class InklingMlpKernel(InklingKernel):
             "down": self.top_k * self.hidden,
         }
         return shapes | self.gate_scratch_shapes()
-
-    @property
-    def scratch_offsets(self) -> dict[str, int]:
-        return scratch_offsets(self.scratch_shapes)[0]
-
-    @property
-    def scratch_size(self) -> int:
-        return scratch_offsets(self.scratch_shapes)[1]
 
     def partial(self, p: MlpParams):
         return p.residual
@@ -262,15 +250,11 @@ class InklingMlpKernel(InklingKernel):
         routed = Int32(0)
         gathered = Int32(0)
         while work.valid:
-            op, a, b, _row = work.item
+            op, a, b, item = work.item
             if cutlass.const_expr(self.messages):
-                if op == MSGDOWN:
-                    w = self.msgdown(p, w, a, b, epoch, warp, lane)
-                elif op == GATEMIX:
-                    w = self.gatemix(p, w, a, b, epoch, warp, lane)
-                elif gathered == 0:
-                    self.gather(p, epoch, tid, warp, lane)
-                    gathered = Int32(1)
+                w, gathered = self.message_item(
+                    p, w, op, a, b, gathered, epoch, tid, warp, lane, item
+                )
             xbuf = Int32(0)
             if op == DOWN:
                 if b != held:
@@ -465,26 +449,7 @@ class InklingMlpKernel(InklingKernel):
                     cute.group_modes(tiles, 0, 2),
                 )
             )
-        gate = None
-        if cutlass.const_expr(self.messages):
-            gate_parts = [
-                cpasync.tma_partition(
-                    atom,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sW, 0, 2),
-                    cute.group_modes(cute.local_tile(g, (ROWS, TILE_K), (None, None)), 0, 2),
-                )
-                for atom, g in zip(gate_tma, gate_g)
-            ]
-            gate = GateParams(
-                tma=tuple(gate_tma),
-                gmem=tuple(part[1] for part in gate_parts),
-                h_part=tagged.pop("h_part"),
-                gated=tagged.pop("gated"),
-                mhalf=tensors["mhalf"],
-                messages=tensors["messages"],
-            )
+        gate = self.gate_params(sW, gate_tma, gate_g, tagged, tensors)
         params = MlpParams(
             tma=tuple(tma),
             gmem=tuple(part[1] for part in parts),

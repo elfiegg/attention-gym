@@ -69,7 +69,6 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
-    GATEMIX,
     MAX_BLOCKS,
     MIX_FLOATS,
     MSGDOWN,
@@ -87,7 +86,6 @@ from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     fp32_reciprocal,
     gate_atoms,
     load_tiles,
-    scratch_offsets,
 )
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     BLOCK,
@@ -253,11 +251,9 @@ class InklingAttnKernel(InklingKernel):
         self.qk_clip, self.rel_clip = qk_clip, rel_clip
         self.splits, self.full, self.window = splits, full, window
         self.log_alpha, self.log_floor = log_alpha, log_floor
-        self.messages = messages
+        self.init_messages(messages, 0, (0, 1, 2) if full else (0, 0, 0))
         self.queries = 3 if full else 1  # block-residual queries of the prologue
         self.streams = 3 if full or messages else 1  # q, k, v input streams
-        self.first_gate = 0
-        self.gate_query = tuple(range(3)) if full else (0, 0, 0)
         self.kv_dim = kv_heads * HEAD_DIM
         self.heads_per_split = q_heads // O_SPLITS
         self.hidden_k_tiles = hidden // TILE_K
@@ -321,14 +317,6 @@ class InklingAttnKernel(InklingKernel):
         }
         return shapes | self.gate_scratch_shapes()
 
-    @property
-    def scratch_offsets(self) -> dict[str, int]:
-        return scratch_offsets(self.scratch_shapes)[0]
-
-    @property
-    def scratch_size(self) -> int:
-        return scratch_offsets(self.scratch_shapes)[1]
-
     def partial(self, p: AttnParams):
         return p.h
 
@@ -387,14 +375,9 @@ class InklingAttnKernel(InklingKernel):
         while work.valid:
             op, a, b, item = work.item
             if cutlass.const_expr(self.messages):
-                if op == MSGDOWN:
-                    w = self.msgdown(p, w, a, b, epoch, warp, lane)
-                elif op == GATEMIX:
-                    w = self.gatemix(p, w, a, b, epoch, warp, lane)
-                elif gathered == 0:
-                    with self.trace_region("gather", payload=item):
-                        self.gather(p, epoch, tid, warp, lane)
-                    gathered = Int32(1)
+                w, gathered = self.message_item(
+                    p, w, op, a, b, gathered, epoch, tid, warp, lane, item
+                )
             if op == QKV:
                 vals, row, chans = self.engine.tile(
                     p, (w,), (), self.stream_of(b), self.hidden_k_tiles, warp, lane
@@ -957,26 +940,7 @@ class InklingAttnKernel(InklingKernel):
                     cute.group_modes(tiles, 0, 2),
                 )
             )
-        gate = None
-        if cutlass.const_expr(self.messages):
-            gate_parts = [
-                cpasync.tma_partition(
-                    atom,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sW, 0, 2),
-                    cute.group_modes(cute.local_tile(g, (ROWS, TILE_K), (None, None)), 0, 2),
-                )
-                for atom, g in zip(gate_tma, gate_g)
-            ]
-            gate = GateParams(
-                tma=tuple(gate_tma),
-                gmem=tuple(part[1] for part in gate_parts),
-                h_part=tagged.pop("h_part"),
-                gated=tagged.pop("gated"),
-                mhalf=tensors["mhalf"],
-                messages=tensors["messages"],
-            )
+        gate = self.gate_params(sW, gate_tma, gate_g, tagged, tensors)
         num_blocks, queries, boundary, embed_input = flags
         params = AttnParams(
             tma=tuple(tma),
