@@ -102,18 +102,22 @@ def fp32_reciprocal(x: float) -> float:
 
 
 @cute.jit
-def fetch_uniform(buf, index, count: cutlass.Constexpr, out, epoch):
-    """``fetch`` of one run of ``count`` words per lane, polled until every lane of the warp
-    has its words, so the lanes leave the loop together: lanes leaving a divergent poll loop one
-    by one and then waiting at a shuffle for the rest measured a fixed ~17k-cycle stall."""
+def fetch_uniform(segments, out, epoch):
+    """``fetch`` polled until every lane of the warp has all its words, so the lanes leave the
+    loop together: lanes leaving a divergent poll loop one by one and then waiting at a shuffle
+    for the rest measured a fixed ~17k-cycle stall. Every lane of the warp must call it."""
     ready = Int32(0)
     while ready == 0:
-        words = load_words(buf, index, count)
         mine = Int32(1)
-        for e in cutlass.range_constexpr(count):
-            value, tag = unpack_tagged(words[e])
-            out[e] = value
-            mine = mine & Int32(tag == epoch)
+        start = 0
+        for s in cutlass.range_constexpr(len(segments)):
+            buf, index, count = segments[s]
+            words = load_words(buf, index, count)
+            for e in cutlass.range_constexpr(count):
+                value, tag = unpack_tagged(words[e])
+                out[start + e] = value
+                mine = mine & Int32(tag == epoch)
+            start += count
         ready = Int32(cute.arch.vote_all_sync(mine != 0))
 
 
@@ -481,7 +485,7 @@ class InklingMlpKernel(WarpSpecialized):
         n = self.experts // 32  # lane l holds experts n*l .. n*l + n - 1
         k = self.top_k
         logits = cute.make_rmem_tensor((n,), Float32)
-        fetch_uniform(p.logits, n * lane, n, logits, epoch)
+        fetch_uniform([(p.logits, n * lane, n)], logits, epoch)
         keys = cute.make_rmem_tensor((n,), Float32)
         scores = cute.make_rmem_tensor((n,), Float32)
         for i in cutlass.range_constexpr(n):
