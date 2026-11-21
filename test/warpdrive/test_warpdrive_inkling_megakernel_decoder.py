@@ -15,7 +15,6 @@ from test_warpdrive_inkling_megakernel_attn import CONFIG, MODEL, clone, require
 
 from attn_gym.warpdrive.examples.inkling_megakernel import ref
 from attn_gym.warpdrive.examples.inkling_megakernel.attn_kernel import compile_attn_kernel
-from attn_gym.warpdrive.examples.inkling_megakernel.fast import decode_step
 from attn_gym.warpdrive.examples.inkling_megakernel.head_kernel import compile_head_kernel
 from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
     InklingDecoder,
@@ -31,11 +30,14 @@ STEPS = 40
 # normalized final state flips: one bf16 ulp of a logit (2 ** -3 at |logit| in [16, 32)), at
 # most, compressed by the softcap.
 HEAD_ATOL = 0.13
-# A decode step's logits stay within a few tenths of fast.decode_step's until a router's 8th
-# and 9th keys nearly tie (margins of 1e-5 occur within tens of steps): rounding then picks
-# another expert at one visit, and both decodes carry that into later steps' caches, moving
-# logits by up to a few units without changing the greedy tokens.
+# A decode step's logits stay within about a unit of the oracle's: the caches carry a step's
+# rounding differences into later steps, and where a router's 8th and 9th keys nearly tie
+# (margins of 1e-5 occur within tens of steps) rounding picks another expert at one visit,
+# which moves logits by up to a few units without changing the greedy token.
 STEP_ATOL = 4.0
+# Best-two logit margins under which the oracle's token is a tie: one bf16 ulp of a logit in
+# [16, 32) is 0.125 (the oracle itself ties exactly at times, broken by the lower index).
+TIE = 0.25
 
 
 @pytest.fixture(autouse=True)
@@ -106,34 +108,35 @@ def prompt_ids(path) -> list[int]:
 @pytest.mark.xdist_group("inkling-checkpoint")
 @torch.no_grad()
 def test_checkpoint_greedy_decode():
-    """``STEPS`` greedy steps after a chat prompt's prefill on Inkling 2 Mini: the decoder
-    picks ``fast.decode_step``'s token every step (each decoding into its own caches), with
-    close logits (``STEP_ATOL``); positions compile nothing after the first step; one step captured in a CUDA graph
-    replays bit-identically to the same step's eager launches, logits and caches. Skips unless
-    the checkpoint is cached; never downloads."""
+    """``STEPS`` greedy steps after a chat prompt's prefill on Inkling 2 Mini, both decoders fed
+    the oracle's token (``ref.forward_tokens``, HF's numerics) into their own caches: the
+    decoder picks the oracle's token every step, unless the oracle's best two logits nearly tie
+    (``TIE``) and it picks the other, with close logits (``STEP_ATOL``); positions compile
+    nothing after the first step; one step captured in a CUDA graph replays bit-identically to
+    the same step's eager launches, logits and caches. Skips unless the checkpoint is cached;
+    never downloads."""
     require_sm100()
     path = checkpoint_path()
     weights = ref.load_inkling_weights(path)
     ids = torch.tensor(prompt_ids(path), device="cuda")
     config = weights.config
     theirs = ref.InklingCache.empty(config, max_len=256)
-    first = ref.forward_tokens(weights, ids, 0, theirs).argmax().reshape(1)
+    token = ref.forward_tokens(weights, ids, 0, theirs).argmax().reshape(1)
     mine = clone(theirs)
     decoder = InklingDecoder(weights)
     pos = torch.tensor([ids.numel()], device="cuda", dtype=torch.int32)
-    token_theirs, token_mine = first.clone(), first.clone()
     counts = None
     for step in range(STEPS):
-        expected = decode_step(weights, token_theirs, pos, theirs)
-        logits = decoder(token_mine, pos, mine)
+        expected = ref.forward_tokens(weights, token, ids.numel() + step, theirs)
+        logits = decoder(token, pos, mine)
         error = (logits - expected).abs().max().item()
-        print(f"step {step}: token {int(expected.argmax())}, logit max error {error:.4f}")
-        assert logits.argmax() == expected.argmax(), step
+        (best, second), (first, other) = expected.topk(2)
+        print(f"step {step}: token {int(first)}, logit max error {error:.4f}")
+        assert logits.argmax() == first or (logits.argmax() == other and best - second < TIE)
         assert error <= STEP_ATOL, step
         if counts is None:
             counts = [f.cache_info().currsize for f in COMPILES]
-        token_theirs.copy_(expected.argmax().reshape(1))
-        token_mine.copy_(logits.argmax().reshape(1))
+        token = first.reshape(1)
         pos += 1
     assert [f.cache_info().currsize for f in COMPILES] == counts
 
@@ -141,15 +144,15 @@ def test_checkpoint_greedy_decode():
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        decoder(token_mine, pos, mine)
+        decoder(token, pos, mine)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            logits = decoder(token_mine, pos, mine)
+            logits = decoder(token, pos, mine)
     torch.cuda.current_stream().wait_stream(stream)
     for _ in range(2):
         for name, tensor in vars(mine).items():
             tensor.copy_(getattr(initial, name))
-        eager = decoder(token_mine, pos, mine).clone()
+        eager = decoder(token, pos, mine).clone()
         eager_cache = clone(mine)
         for name, tensor in vars(mine).items():
             tensor.copy_(getattr(initial, name))
