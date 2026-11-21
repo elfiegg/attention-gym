@@ -21,16 +21,17 @@ from pathlib import Path
 import torch
 import typer
 
-from attn_gym.warpdrive.examples.chat import ChatOptions, run
+from attn_gym.warpdrive.examples.chat import SYNC_EVERY, ChatOptions, run
 from attn_gym.warpdrive.examples.inkling_megakernel.fast import decode_step
 from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
+    CONV_RING,
     InklingCache,
     checkpoint_dir,
     forward_tokens,
     load_inkling_weights,
 )
 
-__all__ = ["check_options", "checkpoint_dir", "load_chat_model"]
+__all__ = ["DEFAULT_BACKEND", "check_options", "checkpoint_dir", "load_chat_model"]
 
 EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 PART = re.compile(
@@ -68,6 +69,7 @@ BACKENDS = {
     "torch": Torch,
     "compile": functools.partial(Torch, compile=True),
 }
+DEFAULT_BACKEND = "torch"
 
 
 def reply_parts(text: str) -> list[tuple[str, str, bool]]:
@@ -77,8 +79,10 @@ def reply_parts(text: str) -> list[tuple[str, str, bool]]:
 
 
 def assistant_message(text: str) -> dict:
-    """The chat-template message of a reply decoded with its special tokens: rendering it
-    reproduces the reply's tokens, so the next turn reuses their cache entries."""
+    """The chat-template message of a reply decoded with its special tokens. The template keeps
+    one thinking and one text part per message, so a reply with several parts of a kind
+    re-renders them joined (and thinking first); the chat then rebuilds its caches. Otherwise the
+    rendering reproduces the reply's tokens and the next turn reuses their cache entries."""
     parts = reply_parts(text)
     message = {"role": "assistant", "content": "".join(t for k, t, _ in parts if k == "text")}
     thinking = "".join(t for k, t, _ in parts if k == "thinking")
@@ -93,6 +97,11 @@ class InklingChatModel:
 
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint)
         self.weights = load_inkling_weights(checkpoint)
+        # The chat decodes up to SYNC_EVERY steps past a stop token, then resumes at the stop
+        # token's position: its convolutions read the kernel - 1 earlier ring rows, which those
+        # over-run steps must not have overwritten.
+        if SYNC_EVERY + self.weights.config.conv_kernel - 1 > CONV_RING:
+            raise ValueError(f"CONV_RING {CONV_RING} is too short for SYNC_EVERY {SYNC_EVERY}")
         self.max_len = options.max_len
         self.cache = InklingCache.empty(self.weights.config, options.max_len)
         self.backend = BACKENDS[options.backend](self.weights, self.cache)

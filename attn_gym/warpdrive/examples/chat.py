@@ -141,6 +141,8 @@ def family_module(model: str):
     """The family module of a Hub repo or checkpoint directory, read from its ``config.json``
     (fetched alone, before any weights)."""
     path = Path(model)
+    if path.is_file():
+        path = path.parent
     if path.is_dir():
         config = path / "config.json"
     else:
@@ -208,6 +210,9 @@ class Chat:
         out = torch.zeros(SYNC_EVERY, device="cuda", dtype=torch.long)
         run = lambda: self.steps(token, out, temperature)
         if self.model.backend.capturable:
+            # Warm-up and capture run real steps at positions 1 .. SYNC_EVERY: the cached prefix
+            # is gone, so the next prefill rebuilds from position 0.
+            self.cached = []
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):  # warm up outside the capture
@@ -312,8 +317,10 @@ def run_turn(chat: Chat, prompt: str, max_new_tokens: int | None, temperature: f
 @app.command()
 def main(
     model: str = typer.Option("Qwen/Qwen3-0.6B", help="HF repo or checkpoint directory"),
-    backend: str = typer.Option(
-        "megakernel", help="decode backend; each family lists its own (Qwen: megakernel, compile)"
+    backend: str | None = typer.Option(
+        None,
+        help="decode backend; each family lists its own (Qwen: megakernel, compile; Inkling: "
+        "reference, torch, compile). Default: the family's DEFAULT_BACKEND.",
     ),
     engine: str = typer.Option("cuda_core", help="Qwen megakernel engine: cuda_core or tcgen05"),
     max_len: int = typer.Option(4096, help="cache capacity (tokens)"),
@@ -335,6 +342,7 @@ def main(
     prompt: str | None = typer.Option(None, help="answer one prompt and exit"),
 ):
     family = family_module(model)
+    backend = backend or family.DEFAULT_BACKEND
     options = ChatOptions(
         backend=backend,
         engine=engine,

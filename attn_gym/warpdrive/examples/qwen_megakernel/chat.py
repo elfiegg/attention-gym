@@ -29,7 +29,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     load_qwen3_weights,
 )
 
-__all__ = ["check_options", "checkpoint_dir", "load_chat_model"]
+__all__ = ["DEFAULT_BACKEND", "check_options", "checkpoint_dir", "load_chat_model"]
 
 # Qwen3's 40,960-position checkpoints were pretrained on 32,768 tokens: Qwen's YaRN setup
 # scales from there. Checkpoints with longer native contexts (Qwen3-2507) scale from theirs.
@@ -71,6 +71,7 @@ class Compiled:
 
 
 BACKENDS = {"megakernel": Megakernel, "compile": Compiled}
+DEFAULT_BACKEND = "megakernel"
 
 
 class QwenChatModel:

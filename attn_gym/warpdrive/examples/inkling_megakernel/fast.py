@@ -4,21 +4,16 @@ device-side positions, static shapes and capturable kernels.
 - Attention reads the whole cache (``max_len`` keys) behind its mask, so shapes never change.
 - Experts run as two ``F.grouped_mm`` calls over the routed (token, expert) rows sorted by
   expert, reading only the routed experts' weights; no host sync (HF's ``grouped_mm`` path).
-- Static short convolutions run on ``attn_gym.linear.short_conv.causal_conv1d`` in fp32 with
-  the three earlier inputs from the cache rings as its initial state.
+- Short convolutions are the oracle's (they read the rings by device position).
 
-Numerics differ from the oracle only in summation order (grouped GEMMs, the top-k sum, the
-convolution kernel); the decode-step test bounds the difference.
+Numerics differ from the oracle only in summation order (grouped GEMMs for attention and
+experts, the top-k sum); the decode-step test bounds the difference.
 """
-
-import math
 
 import torch
 import torch.nn.functional as F
 
-from attn_gym.linear.short_conv import causal_conv1d
 from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
-    CONV_RING,
     InklingCache,
     InklingConfig,
     InklingWeights,
@@ -27,15 +22,6 @@ from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
     hidden_states,
     logits_of,
 )
-
-
-def short_conv(ring, x: torch.Tensor, weight: torch.Tensor, positions, kernel: int):
-    """``ref.short_conv`` on the short-convolution library kernel."""
-    earlier = positions[0] - torch.arange(kernel - 1, 0, -1, device=x.device)
-    past = ring[earlier % CONV_RING] * (earlier >= 0)[:, None].to(ring.dtype)
-    ring[positions[-CONV_RING:] % CONV_RING] = x[-CONV_RING:]
-    out = causal_conv1d(x.float()[None], weight, initial_state=past.float()[None])[0]
-    return ((out + x.float()) / math.sqrt(kernel + 1)).to(torch.bfloat16)
 
 
 def grouped_experts(
@@ -57,7 +43,7 @@ def grouped_experts(
     return unsorted.view(tokens, k, -1).sum(1).to(torch.bfloat16)
 
 
-FAST = Kernels(short_conv=short_conv, experts=grouped_experts)
+FAST = Kernels(experts=grouped_experts)
 
 
 def decode_step(
@@ -71,5 +57,5 @@ def decode_step(
     writes the caches there and returns fp32 logits ``(vocab,)``. No host sync as long as
     ``kernels`` sync nothing (``FAST``'s do not)."""
     positions = pos.reshape(1).long()
-    h = hidden_states(weights, token.reshape(1), positions, cache, cache.max_len, kernels)
+    h = hidden_states(weights, token.reshape(1), positions, cache, None, kernels)
     return logits_of(weights, h)[0]

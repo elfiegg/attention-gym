@@ -531,12 +531,17 @@ def attention(
     k_in: torch.Tensor,
     v_in: torch.Tensor,
     positions: torch.Tensor,
-    kv_len: int,
+    start: int | None,
     kernels: "Kernels",
 ) -> torch.Tensor:
     """Gated relative-bias attention with a sink; writes this visit's K/V and conv inputs at
-    ``positions`` and attends over cache positions ``[0, kv_len)`` with a mask (causal, plus the
-    window in sliding layers). Bias, sink and output gate read the query input ``q_in``."""
+    ``positions`` and attends with a mask (causal, plus the window in sliding layers). Bias, sink
+    and output gate read the query input ``q_in``.
+
+    ``start`` (the first position, known on the host) reads HF's key span, ``[0, start + T)`` or
+    for sliding layers from ``start - window + 1`` (HF's sliding cache keeps window - 1 keys),
+    with HF's per-query-head GEMMs: bitwise HF. ``None`` reads the whole cache with grouped
+    GEMMs: static shapes for CUDA graphs, rounding that differs from HF's."""
     count = q_in.shape[0]
     heads, kv, d, kernel = (
         config.num_q_heads,
@@ -562,16 +567,26 @@ def attention(
     cache.k[visit][:, positions] = k.transpose(0, 1)
     cache.v[visit][:, positions] = v.transpose(0, 1)
 
-    keys, values = cache.k[visit, :, :kv_len], cache.v[visit, :, :kv_len]  # (kv, kv_len, d)
     group = heads // kv
-    scores = q.transpose(0, 1).reshape(kv, group * count, d) @ keys.transpose(1, 2)
+    if start is None:
+        span = slice(0, cache.max_len)
+    else:
+        first = 0 if full else max(0, start - config.sliding_window + 1)
+        span = slice(first, start + count)
+    keys, values = cache.k[visit, :, span], cache.v[visit, :, span]  # (kv, keys, d)
+    if start is None:
+        scores = q.transpose(0, 1).reshape(kv, group * count, d) @ keys.transpose(1, 2)
+    else:  # HF's repeat_kv: one GEMM per query head
+        keys, values = keys.repeat_interleave(group, 0), values.repeat_interleave(group, 0)
+        scores = q.transpose(0, 1) @ keys.transpose(1, 2)
     scores = scores.view(heads, count, -1) * d**-0.5
 
     rel_extent = config.rel_extent if full else config.sliding_window
     rel = F.linear(q_in, w.wrel).view(count, heads, config.d_rel)
     rel = clip_heads(config, rel, w.rel_scale, config.rel_clip, full, positions)
     rel_logits = (rel @ w.rel_proj[:, :rel_extent]).transpose(0, 1)  # (heads, tokens, extent)
-    distance = positions[:, None] - torch.arange(kv_len, device=q.device)[None, :]
+    key_positions = torch.arange(span.start, span.stop, device=q.device)
+    distance = positions[:, None] - key_positions[None, :]
     bias = rel_logits.gather(-1, distance.clamp(0, rel_extent - 1).expand(heads, -1, -1))
     in_extent = (distance >= 0) & (distance < rel_extent)
     scores = scores + bias.masked_fill(~in_extent, 0.0)
@@ -580,7 +595,10 @@ def attention(
 
     sinks = F.linear(q_in, w.wsink).transpose(0, 1)[..., None]  # (heads, tokens, 1)
     probs = torch.cat([scores, sinks], dim=-1).float().softmax(-1)[..., :-1].to(torch.bfloat16)
-    out = probs.view(kv, group * count, -1) @ values
+    if start is None:
+        out = probs.view(kv, group * count, -1) @ values
+    else:
+        out = probs @ values
     out = out.view(heads, count, d).transpose(0, 1).reshape(count, heads * d)
     gate = torch.sigmoid(F.linear(q_in, w.wgate).float())
     return F.linear((out.float() * gate).to(torch.bfloat16), w.wo)
@@ -622,7 +640,7 @@ def decoder_layer(
     messages: torch.Tensor | None,
     cache: InklingCache,
     positions: torch.Tensor,
-    kv_len: int,
+    start: int | None,
     kernels: "Kernels",
 ) -> torch.Tensor:
     """One visit of ``layer`` on bf16 (tokens, hidden) ``h``; ``messages`` (tokens, 4, hidden)
@@ -646,7 +664,7 @@ def decoder_layer(
                 )
                 for i, g in enumerate(w.gates[:3])
             )
-    attn = attention(config, w, cache, visit, full, q_in, k_in, v_in, positions, kv_len, kernels)
+    attn = attention(config, w, cache, visit, full, q_in, k_in, v_in, positions, start, kernels)
     conv = kernels.short_conv
     residual = conv(cache.conv_attn[visit], attn, w.attn_conv, positions, config.conv_kernel)
     residual = residual.float()
@@ -689,14 +707,14 @@ def hidden_states(
     tokens: torch.Tensor,
     positions: torch.Tensor,
     cache: InklingCache,
-    kv_len: int,
+    start: int | None,
     kernels: "Kernels | None" = None,
 ) -> torch.Tensor:
     """The final normalized bf16 (tokens, hidden) states of ``tokens`` at consecutive
-    ``positions``, updating ``cache``. Attention reads cache positions ``[0, kv_len)``: the
-    last position plus one matches HF's GEMM shapes (and so its rounding); any larger value up to
-    ``max_len`` gives a static shape. ``kernels``: implementations of the short convolution and
-    the experts (default: this module's, HF's numerics)."""
+    ``positions``, updating ``cache``. ``start``: the first position on the host for HF's
+    attention spans and rounding, or None for static shapes (see ``attention``). ``kernels``:
+    implementations of the short convolution, experts and MLP half (default: this module's, HF's
+    numerics)."""
     config = weights.config
     kernels = kernels or REFERENCE
     h = rms_norm(F.embedding(tokens, weights.embed), weights.embed_norm, config.rms_eps)
@@ -718,7 +736,7 @@ def hidden_states(
                 messages = block_residual(weights.message_queries[core], prev_blocks, prev_h)
         w = weights.layers[layer]
         out = decoder_layer(
-            config, w, layer, visit, h, blocks, messages, cache, positions, kv_len, kernels
+            config, w, layer, visit, h, blocks, messages, cache, positions, start, kernels
         )
         if layer % config.block_layers == 0:
             blocks = blocks + [h]
@@ -762,5 +780,5 @@ def forward_tokens(
     if pos + tokens.numel() > cache.max_len:
         raise ValueError(f"positions up to {pos + tokens.numel()} exceed max_len {cache.max_len}")
     positions = torch.arange(pos, pos + tokens.numel(), device=tokens.device)
-    h = hidden_states(weights, tokens, positions, cache, kv_len=positions.numel() + pos)
+    h = hidden_states(weights, tokens, positions, cache, start=pos)
     return logits_of(weights, h if all_logits else h[-1:]).squeeze(0)
