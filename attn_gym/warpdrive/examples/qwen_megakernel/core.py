@@ -412,7 +412,7 @@ class CudaCoreGemv:
         # Fully unrolled: the rolled loop kept acc in a 32-byte stack frame.
         for kt in cutlass.range(k_tiles, unroll_full=True):
             with w.consume() as h:
-                sW = h.data["W"]
+                sW = h.view("W")
                 wf = []
                 for r in cutlass.range_constexpr(ROWS_PER_WARP):
                     frag = cute.make_rmem_tensor((8,), BFloat16)
