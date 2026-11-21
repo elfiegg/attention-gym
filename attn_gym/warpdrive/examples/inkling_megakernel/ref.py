@@ -330,7 +330,7 @@ def load_inkling_weights(
     files = {}
     for shard in sorted(checkpoint.glob("model*.safetensors")):
         handle = safe_open(str(shard), "pt", device=str(device))
-        files.update({name: handle for name in handle.keys() if name.startswith("model.llm.")})
+        files.update({name: handle for name in handle.keys() if name.startswith("model.llm.")})  # noqa: SIM118 (safe_open is not a dict)
 
     def get(name: str, dtype: torch.dtype | None = torch.bfloat16) -> torch.Tensor:
         tensor = files[f"model.llm.{name}"].get_tensor(f"model.llm.{name}")
@@ -359,26 +359,26 @@ def load_inkling_weights(
         w13 = experts(p + "mlp.experts.w13_weight")
         # Gate and up rows are interleaved in the checkpoint; HF deinterleaves them.
         w13 = w13.unflatten(1, (-1, 2)).transpose(1, 2).flatten(1, 2).contiguous()
-        fields = dict(
-            wq=get(a + "wq_du.weight"),
-            wk=get(a + "wk_dv.weight"),
-            wv=get(a + "wv_dv.weight"),
-            wo=get(a + "wo_ud.weight"),
-            wgate=get(a + "gate_attn.weight"),
-            wrel=get(a + "wr_du.weight"),
-            wsink=get(a + "attn_sink_proj.weight"),
-            q_scale=get(a + "q_l2_clip.scale"),
-            rel_scale=get(a + "rel_l2_clip.scale"),
-            rel_proj=get(a + "rel_logits_proj.proj"),
-            attn_conv=get(p + "attn_sconv.weight", fp32).squeeze(1),
-            mlp_conv=get(p + "mlp_sconv.weight", fp32).squeeze(1),
-            post_norm=get(p + "mlp_norm.weight"),
-            mlp_query=get(f"attn_res.mlp_queries.{layer}", fp32),
-            router=get(p + "mlp.gate.weight", fp32),
-            router_bias=get(p + "mlp.gate.bias", fp32),
-            w13=w13,
-            w2=experts(p + "mlp.experts.w2_weight"),
-        )
+        fields = {
+            "wq": get(a + "wq_du.weight"),
+            "wk": get(a + "wk_dv.weight"),
+            "wv": get(a + "wv_dv.weight"),
+            "wo": get(a + "wo_ud.weight"),
+            "wgate": get(a + "gate_attn.weight"),
+            "wrel": get(a + "wr_du.weight"),
+            "wsink": get(a + "attn_sink_proj.weight"),
+            "q_scale": get(a + "q_l2_clip.scale"),
+            "rel_scale": get(a + "rel_l2_clip.scale"),
+            "rel_proj": get(a + "rel_logits_proj.proj"),
+            "attn_conv": get(p + "attn_sconv.weight", fp32).squeeze(1),
+            "mlp_conv": get(p + "mlp_sconv.weight", fp32).squeeze(1),
+            "post_norm": get(p + "mlp_norm.weight"),
+            "mlp_query": get(f"attn_res.mlp_queries.{layer}", fp32),
+            "router": get(p + "mlp.gate.weight", fp32),
+            "router_bias": get(p + "mlp.gate.bias", fp32),
+            "w13": w13,
+            "w2": experts(p + "mlp.experts.w2_weight"),
+        }
         if layer > 0:  # attn_queries.i belongs to layer i + 1
             fields["attn_query"] = get(f"attn_res.attn_queries.{layer - 1}", fp32).reshape(
                 -1, config.hidden_size
@@ -500,7 +500,7 @@ def short_conv(ring, x: torch.Tensor, weight: torch.Tensor, positions, kernel: i
     """HF's ``Inkling2LoopShortConvolution``: fp32 depthwise causal convolution (``weight``
     (channels, kernel), the last tap on the current token) plus the input, over
     ``sqrt(kernel + 1)``, rounded to bf16. Runs as HF's ``F.conv1d`` (its summation order)."""
-    count, channels = x.shape
+    channels = x.shape[1]
     history = conv_history(ring, x, positions, kernel)  # (tokens, kernel, channels)
     # The distinct inputs in position order: kernel - 1 earlier tokens, then the new ones.
     sequence = torch.cat([history[0, 1:].flip(0), history[:, 0]]).float().T[None]
