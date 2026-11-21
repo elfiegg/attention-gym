@@ -3,14 +3,18 @@
     python -m attn_gym.warpdrive.examples.inkling_megakernel.chat --backend reference --prompt "Hi"
 
 Prefill runs the PyTorch oracle (``ref.forward_tokens``, one forward pass into the caches).
-Backends: ``reference`` decodes with the same oracle, one eager step at a time (a host sync
-per step: it does not graph-capture).
+Backends:
+
+- ``reference``: the oracle, one eager step at a time (a host sync per step: no CUDA graph);
+- ``torch``: ``fast.decode_step`` (the oracle's dataflow on capturable kernels) in CUDA graphs;
+- ``compile``: the same step under torch.compile (minutes to compile cold), in CUDA graphs.
 
 Replies are sequences of ``<|message_model|><|content_X|>...<|end_message|>`` parts, ``X`` being
 ``thinking`` or ``text``, closed by ``<|content_model_end_sampling|>``; the reply shows thinking
 parts between ``[thinking]`` markers and keeps both for the next turn's history.
 """
 
+import functools
 import re
 from pathlib import Path
 
@@ -18,6 +22,7 @@ import torch
 import typer
 
 from attn_gym.warpdrive.examples.chat import ChatOptions, run
+from attn_gym.warpdrive.examples.inkling_megakernel.fast import decode_step
 from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
     InklingCache,
     checkpoint_dir,
@@ -45,7 +50,24 @@ class Reference:
         return forward_tokens(self.weights, token, int(pos.item()), self.cache)
 
 
-BACKENDS = {"reference": Reference}
+class Torch:
+    """``fast.decode_step``, captured by the chat's CUDA graphs."""
+
+    capturable = True
+
+    def __init__(self, weights, cache: InklingCache, compile: bool = False):
+        self.weights, self.cache = weights, cache
+        self.fn = torch.compile(decode_step) if compile else decode_step
+
+    def step(self, token: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        return self.fn(self.weights, token, pos, self.cache)
+
+
+BACKENDS = {
+    "reference": Reference,
+    "torch": Torch,
+    "compile": functools.partial(Torch, compile=True),
+}
 
 
 def reply_parts(text: str) -> list[tuple[str, str, bool]]:

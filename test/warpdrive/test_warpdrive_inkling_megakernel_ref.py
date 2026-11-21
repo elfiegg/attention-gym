@@ -9,6 +9,7 @@ relative extent the prompt outgrows, and enough tokens to wrap the convolution r
 import pytest
 import torch
 
+from attn_gym.warpdrive.examples.inkling_megakernel.fast import decode_step
 from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
     CONV_RING,
     InklingCache,
@@ -94,3 +95,32 @@ def test_split_prefill_matches_hf_bitwise(models):
     output = hf(tokens[None, :13], use_cache=True)
     expected = hf(tokens[None, 13:], cache=output.past_key_values, use_cache=True).logits[0]
     torch.testing.assert_close(logits, expected, atol=0, rtol=0)
+
+
+@torch.no_grad()
+def test_fast_decode_step_tracks_oracle_and_captures(models):
+    """``fast.decode_step`` differs from the oracle only in summation order: same greedy tokens
+    and close logits over the window, extent and ring boundaries. Its CUDA-graph replay equals its
+    eager run bit for bit."""
+    _, weights = models
+    tokens = prompt(weights)
+    oracle = InklingCache.empty(weights.config, max_len=64)
+    fast = InklingCache.empty(weights.config, max_len=64)
+    forward_tokens(weights, tokens, 0, oracle)
+    forward_tokens(weights, tokens, 0, fast)
+    token, pos = tokens[-1:].clone(), torch.zeros(1, device="cuda", dtype=torch.int32)
+    for step in range(STEPS):
+        expected = forward_tokens(weights, token, PROMPT + step, oracle)
+        pos.fill_(PROMPT + step)
+        logits = decode_step(weights, token, pos, fast)
+        torch.testing.assert_close(logits, expected, atol=0.1, rtol=0, msg=f"step {step}")
+        assert logits.argmax() == expected.argmax()
+        token = expected.argmax().reshape(1)
+
+    # Replay the last step: same inputs, same caches (it rewrites the same rows).
+    eager = decode_step(weights, token, pos, fast)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = decode_step(weights, token, pos, fast)
+    graph.replay()
+    torch.testing.assert_close(captured, eager, atol=0, rtol=0)

@@ -22,6 +22,7 @@ logit. Expert weights are dequantized from the checkpoint's NVFP4 (layers 0-19) 
 
 import json
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -531,6 +532,7 @@ def attention(
     v_in: torch.Tensor,
     positions: torch.Tensor,
     kv_len: int,
+    kernels: "Kernels",
 ) -> torch.Tensor:
     """Gated relative-bias attention with a sink; writes this visit's K/V and conv inputs at
     ``positions`` and attends over cache positions ``[0, kv_len)`` with a mask (causal, plus the
@@ -553,8 +555,8 @@ def attention(
             cache.conv_v[visit], v, v_in, w.v_static, w.v_dynamic, kv, positions, kernel
         )
     else:
-        k = short_conv(cache.conv_k[visit], k, w.k_conv, positions, kernel)
-        v = short_conv(cache.conv_v[visit], v, w.v_conv, positions, kernel)
+        k = kernels.short_conv(cache.conv_k[visit], k, w.k_conv, positions, kernel)
+        v = kernels.short_conv(cache.conv_v[visit], v, w.v_conv, positions, kernel)
     k = l2_clip(k.view(count, kv, d).float(), config.qk_clip).to(torch.bfloat16)
     v = rms_norm(v.view(count, kv, d), None, config.rms_eps)
     cache.k[visit][:, positions] = k.transpose(0, 1)
@@ -621,6 +623,7 @@ def decoder_layer(
     cache: InklingCache,
     positions: torch.Tensor,
     kv_len: int,
+    kernels: "Kernels",
 ) -> torch.Tensor:
     """One visit of ``layer`` on bf16 (tokens, hidden) ``h``; ``messages`` (tokens, 4, hidden)
     fp32 in core passes after the first."""
@@ -643,8 +646,9 @@ def decoder_layer(
                 )
                 for i, g in enumerate(w.gates[:3])
             )
-    attn = attention(config, w, cache, visit, full, q_in, k_in, v_in, positions, kv_len)
-    residual = short_conv(cache.conv_attn[visit], attn, w.attn_conv, positions, config.conv_kernel)
+    attn = attention(config, w, cache, visit, full, q_in, k_in, v_in, positions, kv_len, kernels)
+    conv = kernels.short_conv
+    residual = conv(cache.conv_attn[visit], attn, w.attn_conv, positions, config.conv_kernel)
     residual = residual.float()
     if layer % config.block_layers == 0:  # the attention output starts a new block
         blocks = blocks + [h]
@@ -654,8 +658,8 @@ def decoder_layer(
     if messages is not None:
         x = message_gate(w.gates[3], x, messages[:, 3], eps)
     x = rms_norm(x, w.post_norm, eps).to(torch.bfloat16)
-    y = experts_out(config, w, x, *route(config, w, x))
-    y = short_conv(cache.conv_mlp[visit], y, w.mlp_conv, positions, config.conv_kernel)
+    y = kernels.experts(config, w, x, *route(config, w, x))
+    y = conv(cache.conv_mlp[visit], y, w.mlp_conv, positions, config.conv_kernel)
     return (residual + y.float()).to(torch.bfloat16)
 
 
@@ -665,12 +669,15 @@ def hidden_states(
     positions: torch.Tensor,
     cache: InklingCache,
     kv_len: int,
+    kernels: "Kernels | None" = None,
 ) -> torch.Tensor:
     """The final normalized bf16 (tokens, hidden) states of ``tokens`` at consecutive
     ``positions``, updating ``cache``. Attention reads cache positions ``[0, kv_len)``: the
     last position plus one matches HF's GEMM shapes (and so its rounding); any larger value up to
-    ``max_len`` gives a static shape."""
+    ``max_len`` gives a static shape. ``kernels``: implementations of the short convolution and
+    the experts (default: this module's, HF's numerics)."""
     config = weights.config
+    kernels = kernels or REFERENCE
     h = rms_norm(F.embedding(tokens, weights.embed), weights.embed_norm, config.rms_eps)
     blocks: list[torch.Tensor] = []
     pre_loop: tuple[torch.Tensor, list[torch.Tensor]] | None = None
@@ -688,23 +695,28 @@ def hidden_states(
             if p > 0:
                 prev_blocks, prev_h = previous
                 messages = block_residual(weights.message_queries[core], prev_blocks, prev_h)
+        w = weights.layers[layer]
         out = decoder_layer(
-            config,
-            weights.layers[layer],
-            layer,
-            visit,
-            h,
-            blocks,
-            messages,
-            cache,
-            positions,
-            kv_len,
+            config, w, layer, visit, h, blocks, messages, cache, positions, kv_len, kernels
         )
         if layer % config.block_layers == 0:
             blocks = blocks + [h]
         h = out
     h = block_residual(weights.final_query[None], blocks, h)[:, 0]
     return rms_norm(h, weights.final_norm, config.rms_eps).to(torch.bfloat16)
+
+
+@dataclass(frozen=True)
+class Kernels:
+    """Swappable implementations: ``short_conv(ring, x, weight, positions, kernel)`` and
+    ``experts(config, layer_weights, x, experts, weights)``, with the signatures of this module's
+    ``short_conv`` and ``experts_out``."""
+
+    short_conv: Callable = short_conv
+    experts: Callable = experts_out
+
+
+REFERENCE = Kernels()
 
 
 def logits_of(weights: InklingWeights, h: torch.Tensor) -> torch.Tensor:

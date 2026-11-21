@@ -162,7 +162,7 @@ class CacheFull(typer.BadParameter):
 @dataclass
 class Turn:
     text: str
-    prompt_tokens: int
+    prompt_tokens: int  # tokens prefilled this turn (past the cached prefix)
     prefill_s: float
     tokens: int
     decode_s: float
@@ -180,12 +180,14 @@ class Chat:
 
     @torch.no_grad()
     def prefill(self, ids: list[int]) -> torch.Tensor:
-        """Feed the tokens past the cached prefix; returns the last one's logits."""
+        """Feed the tokens past the cached prefix; returns the last one's logits and how many
+        tokens were fed."""
         if ids[: len(self.cached)] != self.cached or len(ids) == len(self.cached):
             self.cached = []  # the template re-rendered history: start over
-        logits = self.model.prefill(ids[len(self.cached) :], len(self.cached))
+        new = ids[len(self.cached) :]
+        logits = self.model.prefill(new, len(self.cached))
         self.cached = list(ids)
-        return logits
+        return logits, len(new)
 
     def steps(self, token: torch.Tensor, out: torch.Tensor, temperature: float):
         """SYNC_EVERY decode steps: each feeds ``token`` at the next position (``self.pos`` + 1,
@@ -234,7 +236,8 @@ class Chat:
             raise CacheFull(f"the conversation would pass max_len = {model.max_len}")
         run, fed, sampled = self.decoder(temperature)  # before prefill: warm-up writes caches
         start = time.perf_counter()
-        token = sample(self.prefill(ids), temperature)
+        logits, prefilled = self.prefill(ids)
+        token = sample(logits, temperature)
         torch.cuda.synchronize()
         prefill_s = time.perf_counter() - start
         # One run decodes SYNC_EVERY tokens on the GPU; the host then reads them to stream text
@@ -260,7 +263,7 @@ class Chat:
         decode_s = time.perf_counter() - start
         self.cached += out[: runs * SYNC_EVERY]  # the last run's final token was not fed
         self.messages.append(model.assistant_message(out))
-        return Turn(model.reply_text(out), len(ids), prefill_s, len(out), decode_s)
+        return Turn(model.reply_text(out), prefilled, prefill_s, len(out), decode_s)
 
     def restart(self):
         self.messages, self.cached = [], []
