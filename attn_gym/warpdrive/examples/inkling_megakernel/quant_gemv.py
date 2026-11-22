@@ -180,14 +180,12 @@ def mx_scale(scales, r: cutlass.Constexpr) -> Int32:
 
 
 @cute.jit
-def accumulate_subtile(
-    fmt: cutlass.Constexpr, acc, sW, row0, word0, xw, scales, planes, plane_base, lane
-):
+def accumulate_subtile(fmt: cutlass.Constexpr, acc, sW, row0, word0, xw, scales, planes, lane):
     """Add one 256-column subtile to ``acc`` (``(ROWS_PER_WARP, 2)`` fp32: the even and odd
     columns of the lane's rows ``row0 ..``). ``sW``: the stage's ``(32, words)`` Int32
     weights, this subtile from word ``word0``; ``xw``: the lane's 8 input columns as 4 bf16x2
     words; ``scales``: the lane's tile-major scale word (its 4 rows' bytes); ``planes``: flat
-    Int32 NVFP4 magnitude planes, the expert's 256 x 4 words from ``plane_base``."""
+    Int32 NVFP4 magnitude planes, the expert's 256 x 4 words."""
     n = LANE_WORDS[fmt]
     for r in cutlass.range_constexpr(ROWS_PER_WARP):
         wq = cute.make_rmem_tensor((n,), Int32)
@@ -196,8 +194,7 @@ def accumulate_subtile(
             words = mxfp8_bf16x8(wq[0], wq[1], mx_scale(scales, r))
         else:
             lut = cute.make_rmem_tensor((4,), Int32)
-            index = plane_base // 4 + scale_byte(scales, r)
-            cute.autovec_copy(cute.local_tile(planes, (4,), (index,)), lut)
+            cute.autovec_copy(cute.local_tile(planes, (4,), (scale_byte(scales, r),)), lut)
             words = nvfp4_bf16x8(wq[0], [lut[j] for j in range(4)])
         a0, a1 = acc[r, 0], acc[r, 1]
         for j in cutlass.range_constexpr(4):

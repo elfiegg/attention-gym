@@ -44,7 +44,6 @@ import math
 
 import cutlass
 from cutlass import BFloat16, Float32, Int32, Int64, cute
-from cutlass.cute.nvgpu import cpasync
 
 from attn_gym.warpdrive.cache import make_fake_compact_tensor
 from attn_gym.warpdrive.examples.inkling_megakernel import quant
@@ -54,6 +53,7 @@ from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     fetch_uniform,
     fp32_reciprocal,
     load_tiles,
+    tma_atom,
 )
 from attn_gym.warpdrive.examples.inkling_megakernel.quant_gemv import (
     BF16,
@@ -262,7 +262,7 @@ class MlpHalf:
                         word = scales[0, kt, warp * blocks + lane // (32 // blocks)]
                         acc = accumulate_subtile(
                             fmt, acc, stage, warp * ROWS_PER_WARP, j * SUBTILE_WORDS[fmt], xw,
-                            word, planes, 0, lane,
+                            word, planes, lane,
                         )  # fmt: skip
         for r in cutlass.range_constexpr(ROWS_PER_WARP):
             acc[r, 0] = acc[r, 0] + acc[r, 1]
@@ -420,13 +420,7 @@ class MlpHalf:
             sources[1] = cute.make_tensor(w13.iterator, layout)
             layout = cute.make_layout((e * h, width), stride=(width, 1))
             sources[2] = cute.make_tensor(w2.iterator, layout)
-        op = cpasync.CopyBulkTensorTileG2SOp()
-        atoms = []
-        for src, (_, box) in zip(sources, self.mlp_targets()):
-            stride = tuple(math.prod(box[i + 1 :]) for i in range(len(box)))  # row-major
-            smem = cute.make_layout(box, stride=stride)
-            atoms.append(cpasync.make_tiled_tma_atom(op, src, smem, box))
-        return atoms
+        return [tma_atom(src, box) for src, (_, box) in zip(sources, self.mlp_targets())]
 
 
 def fake_expert_args(op: MlpHalf) -> list:
