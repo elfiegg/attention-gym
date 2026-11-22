@@ -3,10 +3,11 @@
 (``quant.experts_out``) with the dense results. The visit launch on them is tested in
 ``test_warpdrive_inkling_megakernel_quant``."""
 
-import gc
+from pathlib import Path
 
 import pytest
 import torch
+from inkling_checkpoint import checkpoint_path
 
 from attn_gym.warpdrive.examples.inkling_megakernel import quant, ref
 from attn_gym.warpdrive.examples.inkling_megakernel.quant import (
@@ -17,15 +18,9 @@ from attn_gym.warpdrive.examples.inkling_megakernel.quant import (
     random_checkpoint_experts,
 )
 
-MODEL = "thinkingmachines/Inkling-2-Mini"
+pytestmark = pytest.mark.usefixtures("release_cuda_memory")
+
 HIDDEN, WIDTH, EXPERTS = 2304, 1152, 128
-
-
-@pytest.fixture(autouse=True)
-def release_cuda_memory():
-    yield
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def require_cuda():
@@ -77,13 +72,10 @@ def test_dense_paths_reject_quantized_experts():
 def checkpoint_layers():
     """Expert tensors of layers 0, 19 (NVFP4) and 20, 23 (MXFP8) as stored, read lazily."""
     require_cuda()
-    hub = pytest.importorskip("huggingface_hub")
-    if not isinstance(hub.try_to_load_from_cache(MODEL, "config.json"), str):
-        pytest.skip(f"{MODEL} is not in the local HF cache")
     from safetensors import safe_open
 
     handles = {}
-    for shard in ref.checkpoint_dir(MODEL).glob("model*.safetensors"):
+    for shard in Path(checkpoint_path()).glob("model*.safetensors"):
         handle = safe_open(str(shard), "pt", device="cuda")
         handles.update(dict.fromkeys(handle.keys(), handle))
 
@@ -113,11 +105,13 @@ def test_checkpoint_layers(checkpoint_layers, layer):
             assert torch.equal(q.dequantize(deinterleave=True), ref_order)
 
 
-def test_load_quantized_model_memory(checkpoint_layers):
+def test_load_quantized_model_memory():
     """The whole model with experts as stored: ~20 GB of device memory."""
+    require_cuda()
+    path = checkpoint_path()
     torch.cuda.synchronize()
     before = torch.cuda.memory_allocated()
-    weights = load_quantized_inkling_weights(MODEL)
+    weights = load_quantized_inkling_weights(path)
     gigabytes = (torch.cuda.memory_allocated() - before) / 1e9
     formats = [layer.w13.format for layer in weights.layers]
     assert formats == [NVFP4] * 20 + [MXFP8] * 4

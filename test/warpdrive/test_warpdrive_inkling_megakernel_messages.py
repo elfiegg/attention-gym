@@ -5,8 +5,6 @@ after the first pass, whose attention and MLP inputs pass through the message ga
 ``ref.attention_block`` and ``ref.mlp_block`` with the oracle's messages; a CUDA graph replay
 of a whole message visit and compile reuse across positions."""
 
-import gc
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -15,13 +13,15 @@ pytest.importorskip("cutlass.cute")
 
 from test_warpdrive_inkling_megakernel_visit import (
     CONFIG,
+    assert_caches_equal,
+    capture,
     check_visit,
     clone,
     random_attention,
     random_cache,
     random_inputs,
     random_mlp,
-    require_sm100,
+    restore,
 )
 
 from attn_gym.warpdrive.examples.inkling_megakernel import ref
@@ -35,12 +35,7 @@ from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
 from attn_gym.warpdrive.examples.inkling_megakernel.msg_kernel import compile_msg_kernel
 from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import compile_visit_kernel
 
-
-@pytest.fixture(autouse=True)
-def release_cuda_memory():
-    yield
-    gc.collect()
-    torch.cuda.empty_cache()
+pytestmark = pytest.mark.usefixtures("requires_blackwell", "release_cuda_memory")
 
 
 def random_core_layer(config: ref.InklingConfig, layer: int, seed: int) -> ref.LayerWeights:
@@ -114,7 +109,6 @@ def test_messages_and_message_halves():
     """Every core layer's four messages match ``ref.block_residual`` to fp32 rounding, and the
     message halves match the gates' down projections on the oracle's bf16 ``rms(m)``; a second
     pass through the same runner rewrites both."""
-    require_sm100()
     config, h = CONFIG, CONFIG.hidden_size
     core = tuple(random_core_layer(config, 7, seed) for seed in range(2))
     queries, _, _ = random_pass(config, len(core), seed=0)
@@ -151,7 +145,6 @@ def test_message_visit_random_weights(layer, blocks, positions):
     gates on the attention's inputs, the MLP gate on the MLP's) against ``ref.attention_block``
     on the oracle's inputs and messages and ``ref.mlp_block`` on the launch's residual, within
     the plain visits' budgets; the gates themselves against ``ref.message_gate``."""
-    require_sm100()
     config = CONFIG
     w = random_core_layer(config, layer, seed=layer)
     queries, block, partial = random_pass(config, 1, seed=layer)
@@ -185,7 +178,6 @@ def test_message_visit_graph_replay_and_compile_reuse():
     """A message visit (messages, attention, MLP) replays bit-identically to eager launches in
     a CUDA graph at device positions that change the KV splits, and positions and block counts
     compile nothing new."""
-    require_sm100()
     config, layer = CONFIG, 11
     w = random_core_layer(config, layer, seed=3)
     queries, block, partial = random_pass(config, 1, seed=3)
@@ -206,25 +198,16 @@ def test_message_visit_graph_replay_and_compile_reuse():
     visit()
     compiles = (compile_msg_kernel, compile_visit_kernel)
     counts = [f.cache_info().currsize for f in compiles]
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        visit()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            visit()
-    torch.cuda.current_stream().wait_stream(stream)
+    graph, _ = capture(visit)
     for pos in (1030, 70, 1100):
         positions.fill_(pos)
         expected_cache = clone(initial)
         expected = visit(expected_cache).clone()
-        for name, tensor in vars(cache).items():
-            tensor.copy_(getattr(initial, name))
+        restore(cache, initial)
         out.zero_()
         graph.replay()
         assert torch.equal(out, expected), pos
-        for name, tensor in vars(cache).items():
-            assert torch.equal(tensor, getattr(expected_cache, name)), (pos, name)
+        assert_caches_equal(cache, expected_cache, pos)
     for blocks in (1, 3):  # block counts are runtime values too
         h, others = random_inputs(config, blocks, seed=blocks)
         runner(w, layer, 0, h, others, cache, positions, out, gates.layer(0))

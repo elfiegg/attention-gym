@@ -6,7 +6,6 @@ widths and a reduced depth, and on the checkpoint a greedy decode against the or
 bit-identical to eager launches."""
 
 import dataclasses
-import gc
 from types import SimpleNamespace
 
 import pytest
@@ -15,12 +14,14 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass.cute")
 
+from inkling_checkpoint import TOKENIZER, WEIGHTS, checkpoint_path
 from test_warpdrive_inkling_megakernel_messages import random_core_layer
 from test_warpdrive_inkling_megakernel_visit import (
     CONFIG,
-    MODEL,
+    assert_caches_equal,
+    capture,
     clone,
-    require_sm100,
+    restore,
     scale_ulps,
 )
 
@@ -32,6 +33,8 @@ from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
 )
 from attn_gym.warpdrive.examples.inkling_megakernel.msg_kernel import compile_msg_kernel
 from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import compile_visit_kernel
+
+pytestmark = pytest.mark.usefixtures("requires_blackwell", "release_cuda_memory")
 
 COMPILES = (compile_visit_kernel, compile_msg_kernel, compile_head_kernel)
 PROMPT = "What is the capital of France? One sentence."
@@ -56,19 +59,11 @@ VISIT_ULPS, NEAR_TIE = 16.0, 1e-3
 TIE = 0.25
 
 
-@pytest.fixture(autouse=True)
-def release_cuda_memory():
-    yield
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
 @torch.no_grad()
 def test_head_random_weights():
     """The head launch against ``ref.hidden_states``' last block residual and norm and
     ``ref.logits_of`` on a random LM head at the real vocabulary (its last tile partial), with
     logits spread over the softcap's range; 1 to 4 blocks."""
-    require_sm100()
     config, h = CONFIG, CONFIG.hidden_size
     gen = torch.Generator(device="cuda").manual_seed(0)
 
@@ -150,7 +145,6 @@ def test_decoder_random_weights():
     different logits: whole-step outputs would not compare). This checks the decoder's
     sequencing: the embedding in layer 0's launch, the block lists, the passes' restarts and
     message states, and the head's blocks."""
-    require_sm100()
     weights = random_model(SMALL, seed=0)
     gen = torch.Generator(device="cuda").manual_seed(1)
     prompt = torch.randint(0, SMALL.vocab_size, (20,), device="cuda", generator=gen)
@@ -191,19 +185,6 @@ def test_decoder_random_weights():
         pos += 1
 
 
-def checkpoint_path():
-    """A complete local snapshot of the checkpoint with its tokenizer; skips otherwise (never
-    downloads)."""
-    hub = pytest.importorskip("huggingface_hub")
-    from huggingface_hub.errors import LocalEntryNotFoundError
-
-    patterns = ["*.json", "model*.safetensors", "*.jinja", "tiktoken/*"]
-    try:
-        return hub.snapshot_download(MODEL, allow_patterns=patterns, local_files_only=True)
-    except LocalEntryNotFoundError as error:
-        pytest.skip(f"{MODEL} is not in the local HF cache: {error}")
-
-
 def prompt_ids(path) -> list[int]:
     from transformers import AutoTokenizer
 
@@ -227,8 +208,7 @@ def test_checkpoint_greedy_decode():
     nothing after the first step; one step captured in a CUDA graph replays bit-identically to
     the same step's eager launches, logits and caches. Skips unless the checkpoint is cached;
     never downloads."""
-    require_sm100()
-    path = checkpoint_path()
+    path = checkpoint_path(WEIGHTS + TOKENIZER)
     weights = ref.load_inkling_weights(path)
     ids = torch.tensor(prompt_ids(path), device="cuda")
     config = weights.config
@@ -253,23 +233,13 @@ def test_checkpoint_greedy_decode():
     assert [f.cache_info().currsize for f in COMPILES] == counts
 
     initial = clone(mine)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        decoder(token, pos, mine)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            logits = decoder(token, pos, mine)
-    torch.cuda.current_stream().wait_stream(stream)
+    graph, logits = capture(lambda: decoder(token, pos, mine))
     for _ in range(2):
-        for name, tensor in vars(mine).items():
-            tensor.copy_(getattr(initial, name))
+        restore(mine, initial)
         eager = decoder(token, pos, mine).clone()
         eager_cache = clone(mine)
-        for name, tensor in vars(mine).items():
-            tensor.copy_(getattr(initial, name))
+        restore(mine, initial)
         logits.zero_()
         graph.replay()
         assert torch.equal(logits, eager)
-        for name, tensor in vars(mine).items():
-            assert torch.equal(tensor, getattr(eager_cache, name)), name
+        assert_caches_equal(mine, eager_cache)

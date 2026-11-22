@@ -8,21 +8,22 @@ compile reuse across positions, on random weights at the real shapes and on the 
 own visits."""
 
 import dataclasses
-import gc
 
 import pytest
 import torch
 
 pytest.importorskip("cutlass.cute")
 
-from attn_gym._backends.arch import cuda_runs_sm100_kernels
+from inkling_checkpoint import checkpoint_path
+
 from attn_gym.warpdrive.examples.inkling_megakernel import ref
 from attn_gym.warpdrive.examples.inkling_megakernel.fast import FAST, decode_step
 from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import InklingVisitMegakernel
 from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import compile_visit_kernel
 
+pytestmark = pytest.mark.usefixtures("requires_blackwell", "release_cuda_memory")
+
 CONFIG = ref.InklingConfig()
-MODEL = "thinkingmachines/Inkling-2-Mini"
 # The residual differs from the oracle mainly through the flash merge: the oracle rounds the
 # softmax probabilities to bf16 before the value sum, the kernel sums unrounded ones. The
 # attention output then differs by an ulp in many elements, which o_proj spreads into bf16
@@ -40,18 +41,6 @@ RING_ULPS, CACHE_ULPS = 1.0, 2.0
 # every down output of its expert a little: on the checkpoint's visits 0.0-0.11 of the outputs
 # change on the oracle's residuals, 0.0-0.23 on the launch's own (max 4 ulps).
 MLP_ULPS, MLP_MAX_CHANGED = 8.0, 0.3
-
-
-@pytest.fixture(autouse=True)
-def release_cuda_memory():
-    yield
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-def require_sm100():
-    if not cuda_runs_sm100_kernels():
-        pytest.skip("the megakernel requires an SM100-family GPU")
 
 
 def random_attention(config: ref.InklingConfig, layer: int, gen) -> dict:
@@ -178,6 +167,31 @@ def clone(cache: ref.InklingCache) -> ref.InklingCache:
     return ref.InklingCache(**{k: v.clone() for k, v in vars(cache).items()})
 
 
+def restore(cache: ref.InklingCache, initial: ref.InklingCache):
+    """Copy ``initial``'s contents into ``cache``'s buffers."""
+    for name, tensor in vars(cache).items():
+        tensor.copy_(getattr(initial, name))
+
+
+def assert_caches_equal(cache: ref.InklingCache, expected: ref.InklingCache, *context):
+    for name, tensor in vars(cache).items():
+        assert torch.equal(tensor, getattr(expected, name)), (*context, name)
+
+
+def capture(fn):
+    """``(graph, result)``: a CUDA graph of one call of ``fn`` and that call's result, after a
+    warm-up call on the capture stream."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fn()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            result = fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    return graph, result
+
+
 def check_visit(
     runner,
     config,
@@ -266,7 +280,6 @@ def test_visit_random_weights(layer, blocks, positions):
     fills, at and across a KV block edge, and past the sliding window (1100 keys: sliding
     layers must read only the last 1024); several launches through one runner (the epoch
     advances)."""
-    require_sm100()
     w = random_layer(CONFIG, layer, seed=layer)
     runner = InklingVisitMegakernel(CONFIG, (w,))
     cache = random_cache(CONFIG, visits=2, max_len=1152, seed=layer)
@@ -283,7 +296,6 @@ def test_visit_random_weights(layer, blocks, positions):
 @torch.no_grad()
 def test_full_layer_log_scaling():
     """A full layer past ``log_scaling_floor``, where queries and relative states scale up."""
-    require_sm100()
     layer = 11
     w = random_layer(CONFIG, layer, seed=7)
     runner = InklingVisitMegakernel(CONFIG, (w,))
@@ -297,7 +309,6 @@ def test_graph_replay_and_compile_reuse():
     """The launch replays bit-identically to eager launches inside a CUDA graph, at device
     positions that change the KV splits, and positions, block counts and cache capacities are
     runtime values: varying them compiles nothing."""
-    require_sm100()
     w = random_layer(CONFIG, 1, seed=1)
     runner = InklingVisitMegakernel(CONFIG, (w,))
     cache = random_cache(CONFIG, visits=1, max_len=1152, seed=1)
@@ -308,27 +319,18 @@ def test_graph_replay_and_compile_reuse():
     runner(w, 1, 0, h, states, cache, positions, out)
     entries = compile_visit_kernel.cache_info().currsize
 
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        runner(w, 1, 0, h, states, cache, positions, out)  # warm up on the capture stream
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            runner(w, 1, 0, h, states, cache, positions, out)
-    torch.cuda.current_stream().wait_stream(stream)
+    graph, _ = capture(lambda: runner(w, 1, 0, h, states, cache, positions, out))
     for pos in (1030, 70, 1030):
         positions.fill_(pos)
         expected_cache = clone(initial)
         expected = runner(w, 1, 0, h, states, expected_cache, positions).clone()
         expected_residual = runner.residual().clone()
-        for name, tensor in vars(cache).items():
-            tensor.copy_(getattr(initial, name))
+        restore(cache, initial)
         out.zero_()
         graph.replay()
         assert torch.equal(out, expected), pos
         assert torch.equal(runner.residual(), expected_residual), pos
-        for name, tensor in vars(cache).items():
-            assert torch.equal(tensor, getattr(expected_cache, name)), (pos, name)
+        assert_caches_equal(cache, expected_cache, pos)
 
     before = compile_visit_kernel.cache_info()
     other = random_cache(CONFIG, visits=1, max_len=2048, seed=3)
@@ -342,21 +344,6 @@ def test_graph_replay_and_compile_reuse():
     assert info.hits + info.misses == before.hits + before.misses + 4  # one per eager launch
 
 
-def checkpoint_weights():
-    """The checkpoint's text decoder from a complete local snapshot; skips otherwise (never
-    downloads)."""
-    hub = pytest.importorskip("huggingface_hub")
-    from huggingface_hub.errors import LocalEntryNotFoundError
-
-    try:
-        path = hub.snapshot_download(
-            MODEL, allow_patterns=["*.json", "model*.safetensors"], local_files_only=True
-        )
-    except LocalEntryNotFoundError as error:
-        pytest.skip(f"{MODEL} is not in the local HF cache: {error}")
-    return ref.load_inkling_weights(path)
-
-
 @pytest.mark.xdist_group("inkling-checkpoint")
 @torch.no_grad()
 def test_checkpoint_visits():
@@ -364,8 +351,7 @@ def test_checkpoint_visits():
     visit's own inputs stays within ``check_visit``'s budgets of ``ref.attention_block`` and of
     ``ref.mlp_block`` on its residual, and routes to the oracle's experts. Skips unless the
     checkpoint is cached; never downloads."""
-    require_sm100()
-    weights = checkpoint_weights()
+    weights = ref.load_inkling_weights(checkpoint_path())
     config = weights.config
     runner = InklingVisitMegakernel(config, weights.layers)
     cache = ref.InklingCache.empty(config, max_len=128)

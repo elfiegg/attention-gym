@@ -7,21 +7,23 @@ CUDA graph replay with one compile per launch kind across positions, and on the 
 over a greedy decode (every visit of every step)."""
 
 import dataclasses
-import gc
 
 import pytest
 import torch
 
 pytest.importorskip("cutlass.cute")
 
+from inkling_checkpoint import checkpoint_path
 from test_warpdrive_inkling_megakernel_messages import random_core_layer, random_pass
 from test_warpdrive_inkling_megakernel_visit import (
     CONFIG,
+    assert_caches_equal,
+    capture,
     clone,
     random_cache,
     random_inputs,
     random_layer,
-    require_sm100,
+    restore,
 )
 
 from attn_gym.warpdrive.examples.inkling_megakernel import quant, ref
@@ -37,19 +39,13 @@ from attn_gym.warpdrive.examples.inkling_megakernel.msg_kernel import compile_ms
 from attn_gym.warpdrive.examples.inkling_megakernel.quant import MXFP8, NVFP4
 from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import compile_visit_kernel
 
-MODEL = "thinkingmachines/Inkling-2-Mini"
+pytestmark = pytest.mark.usefixtures("requires_blackwell", "release_cuda_memory")
+
 # MXFP8 scale bytes down to the smallest with normal products, and finite ones: an inf weight
 # would make dot products NaN.
 MX_SCALES = (quant.MIN_MX_SCALE, 130)
 STEPS = 32
 COMPILES = (compile_visit_kernel, compile_msg_kernel, compile_head_kernel)
-
-
-@pytest.fixture(autouse=True)
-def release_cuda_memory():
-    yield
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def with_quantized_experts(w: ref.LayerWeights, fmt: str, seed: int):
@@ -84,8 +80,7 @@ def assert_bitwise(mine, theirs):
     assert torch.equal(out.view(torch.int16), theirs[0].view(torch.int16))
     assert torch.equal(residual.view(torch.int32), theirs[1].view(torch.int32))
     assert torch.equal(experts, theirs[2])
-    for name, tensor in vars(cache).items():
-        assert torch.equal(tensor, getattr(theirs[3], name)), name
+    assert_caches_equal(cache, theirs[3])
 
 
 @pytest.mark.parametrize(
@@ -96,7 +91,6 @@ def assert_bitwise(mine, theirs):
 @torch.no_grad()
 def test_plain_visit_random_weights(fmt, layer, blocks):
     """Positions 0, before and past the sliding window; the down rows' half subtile."""
-    require_sm100()
     quantized, dense = with_quantized_experts(random_layer(CONFIG, layer, seed=layer), fmt, 10)
     runners = [InklingVisitMegakernel(CONFIG, (w,)) for w in (quantized, dense)]
     cache = random_cache(CONFIG, visits=1, max_len=1152, seed=layer)
@@ -115,7 +109,6 @@ def test_plain_visit_random_weights(fmt, layer, blocks):
 def test_message_visit_random_weights(layer):
     """Core visits after the first pass (sliding layer 7, full layer 11) with NVFP4 experts,
     as the checkpoint's."""
-    require_sm100()
     w = random_core_layer(CONFIG, layer, seed=layer)
     quantized, dense = with_quantized_experts(w, NVFP4, 20)
     queries, block, partial = random_pass(CONFIG, 1, seed=layer)
@@ -138,7 +131,6 @@ def test_graph_replay_and_compile_reuse(fmt):
     """A quantized launch replays bit-identically to eager launches in a CUDA graph at device
     positions that change the KV splits; positions, block counts and cache capacities compile
     nothing new."""
-    require_sm100()
     quantized, _ = with_quantized_experts(random_layer(CONFIG, 1, seed=1), fmt, 30)
     runner = InklingVisitMegakernel(CONFIG, (quantized,))
     cache = random_cache(CONFIG, visits=1, max_len=1152, seed=1)
@@ -148,25 +140,16 @@ def test_graph_replay_and_compile_reuse(fmt):
     out = torch.empty(CONFIG.hidden_size, device="cuda", dtype=torch.bfloat16)
     runner(quantized, 1, 0, h, states, cache, positions, out)
     entries = compile_visit_kernel.cache_info().currsize
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        runner(quantized, 1, 0, h, states, cache, positions, out)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            runner(quantized, 1, 0, h, states, cache, positions, out)
-    torch.cuda.current_stream().wait_stream(stream)
+    graph, _ = capture(lambda: runner(quantized, 1, 0, h, states, cache, positions, out))
     for pos in (1030, 70):
         positions.fill_(pos)
         expected_cache = clone(initial)
         expected = runner(quantized, 1, 0, h, states, expected_cache, positions).clone()
-        for name, tensor in vars(cache).items():
-            tensor.copy_(getattr(initial, name))
+        restore(cache, initial)
         out.zero_()
         graph.replay()
         assert torch.equal(out, expected), pos
-        for name, tensor in vars(cache).items():
-            assert torch.equal(tensor, getattr(expected_cache, name)), (pos, name)
+        assert_caches_equal(cache, expected_cache, pos)
     other = random_cache(CONFIG, visits=1, max_len=2048, seed=3)
     for pos, blocks, target in [(0, 0, cache), (64, 4, cache), (2000, 2, other)]:
         positions.fill_(pos)
@@ -197,11 +180,7 @@ def test_checkpoint_greedy_decode():
     caches and tokens bit for bit; positions compile nothing after the first step; a CUDA
     graph of the quantized step replays bit-identically to its eager launches. Skips unless
     the checkpoint is cached; never downloads."""
-    require_sm100()
-    hub = pytest.importorskip("huggingface_hub")
-    if not isinstance(hub.try_to_load_from_cache(MODEL, "config.json"), str):
-        pytest.skip(f"{MODEL} is not in the local HF cache")
-    weights = quant.load_quantized_inkling_weights(MODEL)
+    weights = quant.load_quantized_inkling_weights(checkpoint_path())
     assert [experts_format(w) for w in weights.layers] == [NVFP4] * 20 + [MXFP8] * 4
     dense = quant.dequantized_weights(weights)
     config = weights.config
@@ -211,8 +190,7 @@ def test_checkpoint_greedy_decode():
     expected = ref.forward_tokens(dense, prompt, 0, caches[1])
     logits = quant.forward_tokens(weights, prompt, 0, caches[0])
     assert torch.equal(logits, expected)
-    for name, tensor in vars(caches[0]).items():
-        assert torch.equal(tensor, getattr(caches[1], name)), name
+    assert_caches_equal(caches[0], caches[1])
     token = logits.argmax().reshape(1)
     decoders = [InklingDecoder(w) for w in (weights, dense)]
     recorders = []
@@ -226,8 +204,7 @@ def test_checkpoint_greedy_decode():
         assert torch.equal(logits[0], logits[1]), step
         assert torch.equal(decoders[0].states, decoders[1].states), step
         assert all(torch.equal(a, b) for a, b in zip(*(r.residuals for r in recorders))), step
-        for name, tensor in vars(caches[0]).items():
-            assert torch.equal(tensor, getattr(caches[1], name)), (step, name)
+        assert_caches_equal(caches[0], caches[1], step)
         for r in recorders:
             r.residuals.clear()
         if counts is None:
@@ -239,22 +216,12 @@ def test_checkpoint_greedy_decode():
     decoder, cache = decoders[0], caches[0]
     decoder.visit = recorders[0].runner
     initial = clone(cache)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        decoder(token, pos, cache)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            logits = decoder(token, pos, cache)
-    torch.cuda.current_stream().wait_stream(stream)
-    for name, tensor in vars(cache).items():
-        tensor.copy_(getattr(initial, name))
+    graph, logits = capture(lambda: decoder(token, pos, cache))
+    restore(cache, initial)
     eager = decoder(token, pos, cache).clone()
     eager_cache = clone(cache)
-    for name, tensor in vars(cache).items():
-        tensor.copy_(getattr(initial, name))
+    restore(cache, initial)
     logits.zero_()
     graph.replay()
     assert torch.equal(logits, eager)
-    for name, tensor in vars(cache).items():
-        assert torch.equal(tensor, getattr(eager_cache, name)), name
+    assert_caches_equal(cache, eager_cache)

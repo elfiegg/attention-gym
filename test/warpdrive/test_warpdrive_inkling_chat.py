@@ -1,10 +1,9 @@
 """Inkling chat history: a parsed reply re-renders to the tokens the model generated."""
 
 import pytest
+from inkling_checkpoint import MODEL
 
 from attn_gym.warpdrive.examples.inkling_megakernel.chat import assistant_message, reply_parts
-
-MODEL = "thinkingmachines/Inkling-2-Mini"
 
 
 @pytest.fixture(scope="module")
