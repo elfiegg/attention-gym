@@ -97,9 +97,12 @@ def test_split_prefill_matches_hf_bitwise(models):
     logits = forward_tokens(weights, tokens[13:-1], 13, cache, all_logits=True)
     last = forward_tokens(weights, tokens[-1:], PROMPT - 1, cache, all_logits=True)
     output = hf(tokens[None, :13], use_cache=True)
-    expected = hf(tokens[None, 13:], cache=output.past_key_values, use_cache=True).logits[0]
-    assert last.shape == (1, expected.shape[-1])
-    torch.testing.assert_close(torch.cat([logits, last]), expected, atol=0, rtol=0)
+    output = hf(tokens[None, 13:-1], cache=output.past_key_values, use_cache=True)
+    expected = output.logits[0]
+    expected_last = hf(tokens[None, -1:], cache=output.past_key_values).logits[0]
+    assert last.shape == expected_last.shape == (1, expected.shape[-1])
+    torch.testing.assert_close(logits, expected, atol=0, rtol=0)
+    torch.testing.assert_close(last, expected_last, atol=0, rtol=0)
 
 
 @torch.no_grad()

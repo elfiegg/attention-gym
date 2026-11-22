@@ -1,9 +1,15 @@
 """Inkling chat history: a parsed reply re-renders to the tokens the model generated."""
 
 import pytest
+import typer
 from inkling_checkpoint import MODEL
 
-from attn_gym.warpdrive.examples.inkling_megakernel.chat import assistant_message, reply_parts
+from attn_gym.warpdrive.examples.chat import ChatOptions
+from attn_gym.warpdrive.examples.inkling_megakernel.chat import (
+    assistant_message,
+    reasoning_effort,
+    reply_parts,
+)
 
 
 @pytest.fixture(scope="module")
@@ -39,3 +45,16 @@ def test_parsed_reply_rerenders_to_its_tokens(tokenizer):
     rendered = tokenizer(history, add_special_tokens=False).input_ids
     assert rendered[: len(ids)] == ids
     assert history[len(prompt + reply) :].startswith(stop)
+
+
+@pytest.mark.parametrize(
+    ("given", "effort"), [(None, "low"), ("high", "high"), ("0.5", 0.5), ("0", 0.0)]
+)
+def test_reasoning_effort_accepts_levels_and_numbers(given, effort):
+    assert reasoning_effort(ChatOptions("reference", reasoning_effort=given)) == effort
+
+
+@pytest.mark.parametrize("given", ["", "nan", "1", "medium-ish"])
+def test_reasoning_effort_rejects_other_values(given):
+    with pytest.raises(typer.BadParameter):
+        reasoning_effort(ChatOptions("reference", reasoning_effort=given))

@@ -283,16 +283,22 @@ class MessageGates:
 class Launch:
     """One kernel's launch state: instruction table, tagged scratch, epoch and the visit
     kernel's trace buffer argument (a placeholder unless ``InklingVisitMegakernel.traced``
-    swaps in its session's). ``trace``: compile ``op`` with that trace backend. Launches
-    sharing it must run one at a time in stream order."""
+    swaps in its session's). ``trace``: compile ``op`` with that trace backend, recording up to
+    ``trace_events`` events per role (default: 32 per table row of a CTA, which covers a work
+    item, its regions and its ring waits at short contexts; a full-attention row waits once per
+    KV block). Launches sharing it must run one at a time in stream order."""
 
-    def __init__(self, op, build, device, trace: str | None = None):
+    def __init__(
+        self, op, build, device, trace: str | None = None, trace_events: int | None = None
+    ):
         device = torch.device(device)
+        self.device = device
         self.workspace, self.max_ctas = op.work.launch_args(device)
         self.table = build(op, self.max_ctas).to(device)
-        if trace is not None:  # a work item, its regions and ring waits per row of a CTA
-            events = 32 * -(-self.table.shape[0] // self.max_ctas) + 64
-            op = op.with_settings(trace_backend=trace, trace_events_per_role=events)
+        if trace is not None:
+            if trace_events is None:
+                trace_events = 32 * -(-self.table.shape[0] // self.max_ctas) + 64
+            op = op.with_settings(trace_backend=trace, trace_events_per_role=trace_events)
             self.workspace = op.work.launch_args(device)[0]  # the traced kernel's stream
         self.op = op
         self.scratch = torch.zeros(op.scratch_size, device=device, dtype=torch.int64)
@@ -373,7 +379,7 @@ class InklingVisitMegakernel:
     occupies every SM until it finishes and fails (CUDA error 720) where its one-CTA-per-SM
     grid cannot be resident at once (see the module docstring). ``trace``: compile with ranges
     for the work items and ``trace_region``s, recorded by ``"globaltimer"`` (``traced``) or
-    ``"iket"``."""
+    ``"iket"``; ``trace_events``: per-role capacity (see ``Launch``; raise it for long contexts)."""
 
     def __init__(
         self,
@@ -381,6 +387,7 @@ class InklingVisitMegakernel:
         layers: tuple[LayerWeights, ...],
         device="cuda",
         trace: str | None = None,
+        trace_events: int | None = None,
     ):
         self.config = config
         self.args = {id(w): VisitLayer.of(config, w) for w in layers}
@@ -388,7 +395,11 @@ class InklingVisitMegakernel:
         formats = sorted({args.experts_format for args in self.args.values()})
         self.launches = {
             (full, messages, fmt): Launch(
-                visit_kernel_for(config, full, messages, fmt), build_visit_table, device, trace
+                visit_kernel_for(config, full, messages, fmt),
+                build_visit_table,
+                device,
+                trace,
+                trace_events,
             )
             for full in (False, True)
             for messages in (False, True)
@@ -520,14 +531,15 @@ class InklingVisitMegakernel:
         exit, ``session.ranges`` hold its ranges (work-item payloads index ``launch_of(...)
         .table``)."""
         launch = self.launch_of(w, layer, messages)
-        compile_visit_kernel(launch.op)  # the session reads range names from the compile
         placeholder = launch.trace_buffer
-        with trace_session(launch.op, launch.max_ctas) as session:
-            launch.trace_buffer = session.prof.tensor
-            try:
-                yield session
-            finally:
-                launch.trace_buffer = placeholder
+        with torch.cuda.device(launch.device):  # the session allocates on the current device
+            compile_visit_kernel(launch.op)  # the session reads range names from the compile
+            with trace_session(launch.op, launch.max_ctas) as session:
+                launch.trace_buffer = session.prof.tensor
+                try:
+                    yield session
+                finally:
+                    launch.trace_buffer = placeholder
 
     def residual(self) -> torch.Tensor:
         """The fp32 ``(hidden,)`` post-attention residual of the last launch, from its tagged

@@ -433,9 +433,11 @@ def test_layer_kind_mismatch_is_rejected():
 
 
 def test_split_partials_publish_with_fences(tmp_path):
-    """The cache-row store's release/acquire edge (``attn_half``'s module docstring) is in the
-    PTX: the newest split's proxy and release fences before it publishes (m, l), and the merge's
-    acquire fence before the store. Results cannot show a missing fence; the PTX can."""
+    """The fences of the cache-row store's release/acquire edge (``attn_half``'s module
+    docstring) are in the PTX: the newest split's proxy and release fences and the merge's
+    acquire fence, counted over the whole sliding-layer kernel (a presence check: it does not
+    check their order against the publish and the store). Results cannot show a missing fence;
+    the PTX can."""
     with capture_ptx(tmp_path) as out:
         compile_visit_kernel.__wrapped__(visit_kernel_for(CONFIG, full=False))
     (path,) = out.glob("*.ptx")

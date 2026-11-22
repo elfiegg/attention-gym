@@ -117,10 +117,9 @@ class MlpHalf:
                 f"{experts} experts: routing reads experts / 32 logits per lane, which must be "
                 "1, 2 or a multiple of 4 (64, 128, 256, ... experts)"
             )
-        if per_lane > 32 or not 1 <= top_k <= min(experts, 32):
-            raise ValueError(
-                "need at most 1024 experts and 1 to min(experts, 32) of them per token"
-            )
+        # experts >= 32 here, so top_k <= 32 also keeps top_k <= experts.
+        if per_lane > 32 or not 1 <= top_k <= 32:
+            raise ValueError("need at most 1024 experts and 1 to 32 of them per token")
         if (width + 7) // 8 + (TILE_K - width % TILE_K) % TILE_K // 8 > COMPUTE_THREADS:
             raise ValueError("the activation fetch covers at most 8 words per compute thread")
         self.width, self.experts, self.top_k = width, experts, top_k
