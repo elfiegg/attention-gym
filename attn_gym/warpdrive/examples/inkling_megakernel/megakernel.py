@@ -32,6 +32,8 @@ Kernels compile from the kernel modules and their imports, so host-side edits he
 nothing.
 """
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -77,6 +79,8 @@ from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import (
     visit_kernel_class,
 )
 from attn_gym.warpdrive.examples.qwen_megakernel.core import ROWS
+from attn_gym.warpdrive.profiler.host import ProfileSession
+from attn_gym.warpdrive.trace_session import trace_session
 
 __all__ = [
     "GateArgs",
@@ -278,12 +282,18 @@ class MessageGates:
 
 class Launch:
     """One kernel's launch state: instruction table, tagged scratch, epoch and the visit
-    kernel's trace buffer argument (a placeholder: the runners compile without tracing).
-    Launches sharing it must run one at a time in stream order."""
+    kernel's trace buffer argument (a placeholder unless ``InklingVisitMegakernel.traced``
+    swaps in its session's). ``trace``: compile ``op`` with that trace backend. Launches
+    sharing it must run one at a time in stream order."""
 
-    def __init__(self, op, build, device):
-        self.workspace, self.max_ctas = op.work.launch_args(torch.device(device))
+    def __init__(self, op, build, device, trace: str | None = None):
+        device = torch.device(device)
+        self.workspace, self.max_ctas = op.work.launch_args(device)
         self.table = build(op, self.max_ctas).to(device)
+        if trace is not None:  # a work item, its regions and ring waits per row of a CTA
+            events = 32 * -(-self.table.shape[0] // self.max_ctas) + 64
+            op = op.with_settings(trace_backend=trace, trace_events_per_role=events)
+            self.workspace = op.work.launch_args(device)[0]  # the traced kernel's stream
         self.op = op
         self.scratch = torch.zeros(op.scratch_size, device=device, dtype=torch.int64)
         self.state = torch.zeros(2, device=device, dtype=torch.int32)
@@ -361,16 +371,24 @@ class InklingVisitMegakernel:
     arguments of ``layers``. Launches of one runner must run one at a time in stream order
     (each kind's launches share a scratch and an epoch). Each launch is cooperative: it
     occupies every SM until it finishes and fails (CUDA error 720) where its one-CTA-per-SM
-    grid cannot be resident at once (see the module docstring)."""
+    grid cannot be resident at once (see the module docstring). ``trace``: compile with ranges
+    for the work items and ``trace_region``s, recorded by ``"globaltimer"`` (``traced``) or
+    ``"iket"``."""
 
-    def __init__(self, config: InklingConfig, layers: tuple[LayerWeights, ...], device="cuda"):
+    def __init__(
+        self,
+        config: InklingConfig,
+        layers: tuple[LayerWeights, ...],
+        device="cuda",
+        trace: str | None = None,
+    ):
         self.config = config
         self.args = {id(w): VisitLayer.of(config, w) for w in layers}
         self.layers = layers  # keeps the ids of ``args`` valid
         formats = sorted({args.experts_format for args in self.args.values()})
         self.launches = {
             (full, messages, fmt): Launch(
-                visit_kernel_for(config, full, messages, fmt), build_visit_table, device
+                visit_kernel_for(config, full, messages, fmt), build_visit_table, device, trace
             )
             for full in (False, True)
             for messages in (False, True)
@@ -492,6 +510,24 @@ class InklingVisitMegakernel:
             launch.max_ctas,
         )
         return out
+
+    @contextmanager
+    def traced(
+        self, w: LayerWeights, layer: int, messages: bool = False
+    ) -> Iterator[ProfileSession]:
+        """A ``trace_session`` of a ``trace="globaltimer"`` runner's launch of layer ``layer``
+        (weights ``w``, with message gates or without): launch it once inside the block; after
+        exit, ``session.ranges`` hold its ranges (work-item payloads index ``launch_of(...)
+        .table``)."""
+        launch = self.launch_of(w, layer, messages)
+        compile_visit_kernel(launch.op)  # the session reads range names from the compile
+        placeholder = launch.trace_buffer
+        with trace_session(launch.op, launch.max_ctas) as session:
+            launch.trace_buffer = session.prof.tensor
+            try:
+                yield session
+            finally:
+                launch.trace_buffer = placeholder
 
     def residual(self) -> torch.Tensor:
         """The fp32 ``(hidden,)`` post-attention residual of the last launch, from its tagged
