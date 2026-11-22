@@ -16,6 +16,7 @@ PyTorch or FA4 feature.
 | Consume a device-built work list | [packed_work.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/packed_work.py) | [Scheduling](scheduling.md) |
 | Decode one token with split KV | [fa4_decode_swapab.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py) | [Decode](#single-token-decode), [shared KV](#shared-kv-ring) |
 | Run a whole Qwen3 decode step as one persistent launch per layer | [qwen_megakernel.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel/runner.py) | [Qwen3 megakernel](#qwen3-decode-megakernel) |
+| Decode a looped MoE (Inkling 2 Mini) with one launch per layer visit | [inkling_megakernel](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/inkling_megakernel/megakernel.py) | [Inkling 2 Mini megakernel](#inkling-2-mini-decode-megakernel) |
 | Mix managed and raw synchronization | [raw_interop.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/raw_interop.py) | [Dropping down](dropping-down.md) |
 | Reuse CUTLASS or FA4 tile orders | [external_maps.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/external_maps.py) | [External tile orders](scheduling.md#external-tile-orders-subclass-workmap) |
 | Visualize which CTA runs each item | [schedule_views.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/schedule_views.py) | [Tracing](tracing.md#see-which-cta-runs-what) |
@@ -751,6 +752,53 @@ The tagged-word protocol crosses clusters and uses raw code, not the layer's
 not its cross-CTA critical path; see [raw code and opt-outs](guarantees.md#opt-outs).
 
 </details>
+
+## Inkling 2 Mini decode megakernel
+
+``inkling_megakernel`` decodes Thinking Machines' Inkling 2 Mini (``thinkingmachines/Inkling-2-Mini``)
+at batch one. The model runs its 24 layers as 48 *visits*: layers 0-5 once, layers 6-17 three
+times with shared weights (every pass restarts from layer 5's output and reads gated messages
+from the previous pass), layers 18-23 once. Each visit has its own KV cache and short-convolution
+rings.
+
+```bash
+python -m attn_gym.warpdrive.examples.inkling_megakernel.chat --prompt "Hi" --reasoning-effort low
+python -m attn_gym.warpdrive.examples.inkling_megakernel.bench --context 1100
+```
+
+- **Oracle.** ``ref.py`` is a PyTorch implementation with HF's dtype boundaries; given the same
+  weights it equals HF's eager ``Inkling2LoopForCausalLM`` bit for bit on the tiny test model and
+  short real prompts (its docstring states the scope). ``fast.py`` runs the same dataflow as a
+  CUDA-graph capturable torch step.
+- **Launches.** A step is 51 launches: one per visit (its attention half, then its MLP half in
+  the same persistent grid, the halves' rows ordered so the static schedule cannot deadlock), one
+  per loop pass after the first (all 48 messages and the message half of every gate's down
+  projection, which depend only on the previous pass), and one head launch (final block residual,
+  norm, LM head, softcap). Cross-CTA dependencies are the Qwen megakernel's epoch-tagged words.
+- **Experts.** The checkpoint stores experts as NVFP4 (layers 0-19) and MXFP8 (layers 20-23);
+  the kernel streams them as stored and dequantizes in registers, reproducing the bf16-rounded
+  weights exactly, so its outputs equal the bf16-dequantized kernel's bit for bit
+  (``--backend megakernel-bf16`` keeps that path). Weights take 19 GB on the device.
+- **Numerics.** Per visit within a few bf16 ulps of the oracle (fp32 summation order and the
+  flash-decoding merge); greedy tokens equal the oracle's over the tested decodes.
+
+GB300, CUDA-graph replay, context 1100 (2026-11-22, branch ``inkling2-mini-megakernel``):
+
+| Backend | ms per token | tok/s (chat) |
+|---|---:|---:|
+| oracle, eager | ~435 | ~2 |
+| torch step + CUDA graph | 28.7 | 34 |
+| ``torch.compile`` + CUDA graph | ~17-18 | 55 |
+| megakernel, bf16 experts | 3.21 | 307 |
+| megakernel, quantized experts | 3.02 | 328 |
+
+The bf16 bandwidth floor is about 1.4 ms per token (about 0.6 ms with quantized experts). The
+step is latency-bound: the serial chain from a visit's attention output to its first expert row
+(residual, norm, router, top-8) costs about 9 us per visit, and NVFP4 decoding is ALU-bound, so the
+quantized experts save less than their 3.5x fewer bytes suggest. A visit grid needs all its
+CTAs resident at once, so visit launches are cooperative: one CTA per SM, admitted only when the
+whole grid fits (otherwise the launch fails, e.g. under MPS or green-context SM limits). Callers
+keep ``0 <= pos < max_len``; positions are read on the device.
 
 ## Known limits
 
