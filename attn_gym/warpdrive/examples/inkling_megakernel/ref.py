@@ -334,10 +334,10 @@ def load_inkling_weights(
     """The text decoder of an Inkling 2 Mini checkpoint in its original naming
     (``model.llm.*``): a Hub repo, a checkpoint directory, or a file inside one.
 
-    ``experts(weight, scale, amax, denominator, gate_up)``, when given, replaces the bf16
+    ``experts(weight, scale, amax, denominator)``, when given, replaces the bf16
     dequantization (and the gate/up row deinterleave) of each layer's expert tensors; its
-    result is stored in ``w13``/``w2`` as is. ``scale``, ``amax`` and ``denominator`` are None
-    when the checkpoint has none; ``gate_up`` is true for ``w13``."""
+    result is stored in ``w13``/``w2`` as is. It takes ``dequantize_experts``' arguments:
+    ``scale``, ``amax`` and ``denominator`` are None when the checkpoint has none."""
     from safetensors import safe_open  # optional: the oracle needs only torch
 
     checkpoint = checkpoint_dir(path_or_repo)
@@ -358,7 +358,7 @@ def load_inkling_weights(
         parts = [f"{prefix}_scale", f"{prefix}_amax", f"{prefix}_outer_scale_denominator"]
         args = (get(prefix, None), *(get(p, None) if has(p) else None for p in parts))
         if experts is not None:
-            return experts(*args, gate_up)
+            return experts(*args)
         w = dequantize_experts(*args)
         if gate_up:  # gate and up rows are interleaved in the checkpoint; HF deinterleaves them
             w = w.unflatten(1, (-1, 2)).transpose(1, 2).flatten(1, 2).contiguous()
@@ -634,10 +634,12 @@ def route(config: InklingConfig, w: LayerWeights, x: torch.Tensor):
 def require_dense_experts(w: LayerWeights):
     """Raise unless the layer's experts are dense tensors: weights loaded through
     ``load_inkling_weights``' ``experts`` hook (e.g. quantized) need their own kernels."""
-    if not (isinstance(w.w13, torch.Tensor) and isinstance(w.w2, torch.Tensor)):
-        raise TypeError(
-            f"dense bf16 experts required, got {type(w.w13).__name__}; dequantize them first"
-        )
+    for name in ("w13", "w2"):
+        if not isinstance(getattr(w, name), torch.Tensor):
+            raise TypeError(
+                f"dense bf16 experts required, got {type(getattr(w, name)).__name__} {name}; "
+                "dequantize them first"
+            )
 
 
 def experts_out(config: InklingConfig, w: LayerWeights, x: torch.Tensor, experts, weights):
