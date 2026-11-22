@@ -8,6 +8,7 @@ compile reuse across positions, on random weights at the real shapes and on the 
 own visits."""
 
 import dataclasses
+from pathlib import Path
 
 import pytest
 import torch
@@ -16,6 +17,7 @@ pytest.importorskip("cutlass.cute")
 
 from inkling_checkpoint import checkpoint_path
 
+from attn_gym.warpdrive.cache._key import module_closure
 from attn_gym.warpdrive.examples.inkling_megakernel import ref
 from attn_gym.warpdrive.examples.inkling_megakernel.fast import FAST, decode_step
 from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import InklingVisitMegakernel
@@ -398,3 +400,13 @@ def test_checkpoint_visits():
     decode_step(weights, token, pos, cache, dataclasses.replace(FAST, attention_block=spy))
     plain = [v for v, layer, p in config.visits() if not (config.is_loop(layer) and p > 0)]
     assert visits == plain
+
+
+def test_kernels_compile_from_kernel_modules_only():
+    """The compile keys of the Inkling launches hash only kernel modules: editing the oracle,
+    the quantized-expert loader or the host runners recompiles nothing."""
+    package = Path(ref.__file__).parent
+    host = {package / f"{name}.py" for name in ("ref", "quant", "megakernel", "fast", "bench")}
+    for kernel in ("visit_kernel", "msg_kernel", "head_kernel"):
+        assert not host & set(module_closure(package / f"{kernel}.py")), kernel
+

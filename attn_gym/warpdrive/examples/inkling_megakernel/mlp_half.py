@@ -46,7 +46,6 @@ import cutlass
 from cutlass import BFloat16, Float32, Int32, Int64, cute
 
 from attn_gym.warpdrive.cache import make_fake_compact_tensor
-from attn_gym.warpdrive.examples.inkling_megakernel import quant
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     BACKOFF_NS,
     RING,
@@ -61,6 +60,7 @@ from attn_gym.warpdrive.examples.inkling_megakernel.quant_gemv import (
     FORMATS,
     LANE_WORDS,
     SUBTILE_WORDS,
+    NVFP4,
     accumulate_subtile,
 )
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
@@ -128,7 +128,7 @@ class MlpHalf:
         # gate/up rows have) and the expert's plane words (NVFP4).
         self.meta_subtiles = self.hidden_k_tiles
         self.scale_words = 8 * BLOCKS[experts_format] if self.quantized else 0
-        self.plane_words = 1024 if experts_format == quant.NVFP4 else 0
+        self.plane_words = 1024 if experts_format == NVFP4 else 0
         self.meta_stage_bytes = 4 * (self.meta_subtiles * self.scale_words + self.plane_words)
 
     def mlp_scratch_shapes(self) -> dict[str, int]:

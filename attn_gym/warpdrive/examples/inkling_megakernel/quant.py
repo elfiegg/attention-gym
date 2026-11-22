@@ -40,12 +40,16 @@ from pathlib import Path
 import torch
 
 from attn_gym.warpdrive.examples.inkling_megakernel import ref
+from attn_gym.warpdrive.examples.inkling_megakernel.quant_gemv import (
+    BLOCK_COLUMNS,
+    MXFP8,
+    NVFP4,
+    SUBTILE,
+    TILE_ROWS,
+    WARPS,
+)
 
-NVFP4, MXFP8 = "nvfp4", "mxfp8"
-# The GEMV's geometry (quant_gemv checks it against the engine's).
-TILE_ROWS, SUBTILE, WARPS = 32, 256, 8
 WARP_ROWS = TILE_ROWS // WARPS
-BLOCK_COLUMNS = {NVFP4: 16, MXFP8: 32}
 MIN_MX_SCALE = 10  # smallest MXFP8 scale byte whose products with e4m3 values are normal
 CHUNK = 8  # experts per conversion step: bounds the int64 temporaries
 

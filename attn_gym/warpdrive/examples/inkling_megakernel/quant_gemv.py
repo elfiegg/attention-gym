@@ -39,7 +39,6 @@ from cutlass import Float32, Int32, cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from attn_gym.warpdrive.examples.inkling_megakernel import quant
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     COMPUTE_WARPS,
     ROWS,
@@ -47,14 +46,16 @@ from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     TILE_K,
 )
 
-BF16 = "bf16"
-FORMATS = (BF16, quant.NVFP4, quant.MXFP8)
-LANE_WORDS = {quant.NVFP4: 1, quant.MXFP8: 2}  # weight words per lane, row, subtile
+# The experts formats and the layout geometry they share with ``quant``, which imports them
+# from here: kernel modules import no host module, so host-side edits recompile nothing.
+BF16, NVFP4, MXFP8 = "bf16", "nvfp4", "mxfp8"
+FORMATS = (BF16, NVFP4, MXFP8)
+TILE_ROWS, SUBTILE, WARPS = ROWS, TILE_K, COMPUTE_WARPS  # a weight tile and its warps
+BLOCK_COLUMNS = {NVFP4: 16, MXFP8: 32}  # columns per scale byte
+LANE_WORDS = {NVFP4: 1, MXFP8: 2}  # weight words per lane, row, subtile
 SUBTILE_WORDS = {f: 32 * w for f, w in LANE_WORDS.items()}
 # Tile-major scale words per subtile: 8 warps x blocks (each word: a block's 4 warp rows).
-BLOCKS = {fmt: TILE_K // columns for fmt, columns in quant.BLOCK_COLUMNS.items()}
-
-assert (ROWS, TILE_K, COMPUTE_WARPS) == (quant.TILE_ROWS, quant.SUBTILE, quant.WARPS)
+BLOCKS = {fmt: TILE_K // columns for fmt, columns in BLOCK_COLUMNS.items()}
 
 
 # ------------------------------------------------------------------ register decode
@@ -190,7 +191,7 @@ def accumulate_subtile(fmt: cutlass.Constexpr, acc, sW, row0, word0, xw, scales,
     for r in cutlass.range_constexpr(ROWS_PER_WARP):
         wq = cute.make_rmem_tensor((n,), Int32)
         cute.autovec_copy(cute.local_tile(sW[row0 + r, None], (n,), (word0 // n + lane,)), wq)
-        if cutlass.const_expr(fmt == quant.MXFP8):
+        if cutlass.const_expr(fmt == MXFP8):
             words = mxfp8_bf16x8(wq[0], wq[1], mx_scale(scales, r))
         else:
             lut = cute.make_rmem_tensor((4,), Int32)
