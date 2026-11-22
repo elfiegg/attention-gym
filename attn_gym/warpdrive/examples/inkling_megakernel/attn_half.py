@@ -159,6 +159,11 @@ class AttentionHalf:
             raise ValueError("an o_proj split merges one head per warp in whole 256-column tiles")
         if (q_heads // O_SPLITS) % (q_heads // kv_heads):
             raise ValueError("an o_proj split must cover whole groups of q heads")
+        if q_heads // O_SPLITS * HEAD_DIM > hidden:
+            raise ValueError(
+                f"an o_proj split's {q_heads // O_SPLITS} heads x {HEAD_DIM} merge into one "
+                f"hidden-size ({hidden}) input row: need q_heads <= {O_SPLITS * hidden // HEAD_DIM}"
+            )
         if d_rel % 8 or d_rel > 32 or not 0 < extent <= min(rel_width, hidden):
             raise ValueError("need d_rel a multiple of 8 up to 32 and extent <= rel_width, hidden")
         if full and conv_kernel % 2:
