@@ -206,8 +206,10 @@ class LayerWeights:
     mlp_query: torch.Tensor  # (hidden,) fp32
     router: torch.Tensor  # (experts, hidden) fp32
     router_bias: torch.Tensor  # (experts,) fp32
-    w13: torch.Tensor  # (experts, 2 * moe_intermediate, hidden): gate rows, then up rows
-    w2: torch.Tensor  # (experts, hidden, moe_intermediate)
+    # bf16 (experts, 2 * moe_intermediate, hidden): gate rows, then up rows; or the result of
+    # load_inkling_weights' ``experts`` hook (e.g. quant.QuantExperts, checkpoint row order).
+    w13: torch.Tensor
+    w2: torch.Tensor  # bf16 (experts, hidden, moe_intermediate), or the hook's result
     attn_query: torch.Tensor | None = None  # (1 or 3, hidden) fp32; None for layer 0
     input_norm: torch.Tensor | None = None
     q_norm: torch.Tensor | None = None
@@ -327,10 +329,15 @@ def dequantize_experts(
 
 
 def load_inkling_weights(
-    path_or_repo: str | Path = "thinkingmachines/Inkling-2-Mini", device="cuda"
+    path_or_repo: str | Path = "thinkingmachines/Inkling-2-Mini", device="cuda", experts=None
 ) -> InklingWeights:
     """The text decoder of an Inkling 2 Mini checkpoint in its original naming
-    (``model.llm.*``): a Hub repo, a checkpoint directory, or a file inside one."""
+    (``model.llm.*``): a Hub repo, a checkpoint directory, or a file inside one.
+
+    ``experts(weight, scale, amax, denominator, gate_up)``, when given, replaces the bf16
+    dequantization (and the gate/up row deinterleave) of each layer's expert tensors; its
+    result is stored in ``w13``/``w2`` as is. ``scale``, ``amax`` and ``denominator`` are None
+    when the checkpoint has none; ``gate_up`` is true for ``w13``."""
     from safetensors import safe_open  # optional: the oracle needs only torch
 
     checkpoint = checkpoint_dir(path_or_repo)
@@ -347,11 +354,15 @@ def load_inkling_weights(
     def has(name: str) -> bool:
         return f"model.llm.{name}" in files
 
-    def experts(prefix: str) -> torch.Tensor:
+    def load_experts(prefix: str, gate_up: bool):
         parts = [f"{prefix}_scale", f"{prefix}_amax", f"{prefix}_outer_scale_denominator"]
-        return dequantize_experts(
-            get(prefix, None), *(get(p, None) if has(p) else None for p in parts)
-        )
+        args = (get(prefix, None), *(get(p, None) if has(p) else None for p in parts))
+        if experts is not None:
+            return experts(*args, gate_up)
+        w = dequantize_experts(*args)
+        if gate_up:  # gate and up rows are interleaved in the checkpoint; HF deinterleaves them
+            w = w.unflatten(1, (-1, 2)).transpose(1, 2).flatten(1, 2).contiguous()
+        return w
 
     fp32 = torch.float32
     # The checkpoint stores query and MLP message queries of each core layer in one tensor and
@@ -364,9 +375,6 @@ def load_inkling_weights(
     for layer in range(config.num_layers):
         p = f"layers.{layer}."
         a = p + "attn."
-        w13 = experts(p + "mlp.experts.w13_weight")
-        # Gate and up rows are interleaved in the checkpoint; HF deinterleaves them.
-        w13 = w13.unflatten(1, (-1, 2)).transpose(1, 2).flatten(1, 2).contiguous()
         fields = {
             "wq": get(a + "wq_du.weight"),
             "wk": get(a + "wk_dv.weight"),
@@ -384,8 +392,8 @@ def load_inkling_weights(
             "mlp_query": get(f"attn_res.mlp_queries.{layer}", fp32),
             "router": get(p + "mlp.gate.weight", fp32),
             "router_bias": get(p + "mlp.gate.bias", fp32),
-            "w13": w13,
-            "w2": experts(p + "mlp.experts.w2_weight"),
+            "w13": load_experts(p + "mlp.experts.w13_weight", True),
+            "w2": load_experts(p + "mlp.experts.w2_weight", False),
         }
         if layer > 0:  # attn_queries.i belongs to layer i + 1
             fields["attn_query"] = get(f"attn_res.attn_queries.{layer - 1}", fp32).reshape(
@@ -623,9 +631,19 @@ def route(config: InklingConfig, w: LayerWeights, x: torch.Tensor):
     return experts, weights * config.route_scale
 
 
+def require_dense_experts(w: LayerWeights):
+    """Raise unless the layer's experts are dense tensors: weights loaded through
+    ``load_inkling_weights``' ``experts`` hook (e.g. quantized) need their own kernels."""
+    if not (isinstance(w.w13, torch.Tensor) and isinstance(w.w2, torch.Tensor)):
+        raise TypeError(
+            f"dense bf16 experts required, got {type(w.w13).__name__}; dequantize them first"
+        )
+
+
 def experts_out(config: InklingConfig, w: LayerWeights, x: torch.Tensor, experts, weights):
     """The routed experts' fp32 sum on bf16 (tokens, hidden) ``x``, added in ascending expert
     order as HF does; returns bf16. Softcapped SwiGLU: ``capg(g) sigmoid(g) capu(u)``."""
+    require_dense_experts(w)
     out = torch.zeros(x.shape, device=x.device, dtype=torch.float32)
     for e in experts.unique().tolist():  # ascending
         token, slot = (experts == e).nonzero(as_tuple=True)
