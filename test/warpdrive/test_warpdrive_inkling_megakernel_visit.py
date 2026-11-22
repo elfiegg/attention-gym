@@ -344,6 +344,28 @@ def test_graph_replay_and_compile_reuse():
     assert info.hits + info.misses == before.hits + before.misses + 4  # one per eager launch
 
 
+@torch.no_grad()
+def test_grid_beyond_residency_is_rejected():
+    """The visit launch is cooperative: a grid with more CTAs than can be resident at once (as
+    when another kernel or an SM limit leaves fewer SMs) fails at launch instead of spinning
+    forever on CTAs that never start, and the runner works again afterwards."""
+    w = random_layer(CONFIG, 1, seed=1)
+    runner = InklingVisitMegakernel(CONFIG, (w,))
+    cache = random_cache(CONFIG, visits=1, max_len=1152, seed=1)
+    h, states = random_inputs(CONFIG, 1, seed=2)
+    positions = torch.tensor([100], device="cuda")
+    expected = runner(w, 1, 0, h, states, clone(cache), positions).clone()
+    launch = runner.launch_of(w, 1, False)
+    launch.max_ctas += 1
+    # cudaErrorCooperativeLaunchTooLarge: a RuntimeError, or the DSL's own error type on the
+    # launch right after a compile.
+    with pytest.raises(Exception, match="720"):
+        runner(w, 1, 0, h, states, clone(cache), positions)
+        torch.cuda.synchronize()
+    launch.max_ctas -= 1
+    assert torch.equal(runner(w, 1, 0, h, states, cache, positions), expected)
+
+
 @pytest.mark.xdist_group("inkling-checkpoint")
 @torch.no_grad()
 def test_checkpoint_visits():

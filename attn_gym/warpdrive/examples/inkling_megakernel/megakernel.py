@@ -13,6 +13,11 @@ visit's output stays in a per-visit buffer that later block residuals read. Laun
 every input from device memory (token and position too) and sync nothing, so a step is
 CUDA-graph capturable, and every launch kind compiles once for all positions.
 
+A visit launch's CTAs wait on each other's tagged words, so it needs its whole grid (one CTA
+per SM) resident: it launches cooperatively, which the driver admits only when every CTA can
+be resident (it fails with CUDA error 720 under a smaller SM limit, such as an MPS or green
+context partition). The message and head launches' CTAs wait on nothing outside themselves.
+
 The experts stream in each layer's stored format: bf16 tensors, or ``quant.QuantExperts`` as
 ``quant.load_quantized_inkling_weights`` keeps them (NVFP4 layers 0-19, MXFP8 20-23 for
 Inkling 2 Mini); the quantized launches decode them in registers to the same dot products,

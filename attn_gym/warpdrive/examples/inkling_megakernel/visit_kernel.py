@@ -28,8 +28,11 @@ the stages and publish tagged words ``(fp32 value, launch epoch)``; consumers sp
 loads until every word carries the epoch. The host deals the rows to CTAs in dependency order
 (``megakernel.build_visit_table``) for ``StaticPersistent``; with every CTA resident, the
 earliest unfinished row always has its producers finished (the MLP prologue's producers are
-attention rows, which precede every MLP row of every CTA). The last CTA to finish advances the
-epoch, so one runner's launches may follow each other in a stream or a CUDA graph.
+attention rows, which precede every MLP row of every CTA). The launch is cooperative, so the
+driver starts it only with all of its one-CTA-per-SM grid resident and rejects a grid that
+cannot be (CUDA error 720, e.g. under an MPS or green-context SM limit) instead of letting a
+kernel on another stream hold SMs that spinning CTAs wait for. The last CTA to finish advances
+the epoch, so one runner's launches may follow each other in a stream or a CUDA graph.
 
 Quantized experts add a second ring, ``meta`` (load warp -> compute warps), for each expert
 row's scales and planes (``mlp_half``); ``InklingQuantVisitKernel``'s roles take its ends.
@@ -618,7 +621,7 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
             (block0, block1, block2, block3),
             bound,
             (num_blocks, queries, boundary, embed_input),
-        ).launch(**self.launch_config(bound), stream=stream)
+        ).launch(**self.launch_config(bound), stream=stream, cooperative=True)
 
 
 class InklingQuantVisitKernel(InklingVisitKernel):
