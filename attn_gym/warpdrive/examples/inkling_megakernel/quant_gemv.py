@@ -14,21 +14,24 @@ Per lane, row and 256-column subtile (columns ``8l .. 8l + 7``):
   ``nvfp4_bf16x8`` selects each column's low and high magnitude byte with ``prmt`` (the
   code's magnitude is the selector nibble), XORs the sign into the high byte and interleaves
   the bytes into 4 bf16x2 words: 12 ALU-pipe instructions (PRMT, LOP3) per 8 weights, plus 2
-  shifts that ptxas emits as IMAD.HI/IMAD.SHL on the FMA pipe. The planes must be in SMEM:
-  gathers from global memory through L1 cost a standalone expert GEMV 4.4 us of 19 per expert
-  set on GB300.
+  shifts that ptxas emits as IMAD.HI/IMAD.SHL on the FMA pipe. The planes must be in SMEM
+  (see below).
 - MXFP8: two words of e4m3 bytes; ``mxfp8_bf16x8`` converts each byte pair exactly
   (``cvt.rn.bf16x2.e4m3x2``) and multiplies by the bf16 power of two ``2 ** (s - 127)``
   (``mul.rn.bf16x2``, exact): 4 ALU + 4 FMA-pipe instructions per 8 weights.
-- bf16: four bf16x2 words.
 
 bf16x2 weight words accumulate with ``fma_bf16x2`` (``fma.rn.f32.bf16``, SASS
 ``FHFMA.BF16``): an fp32 FMA of exact bf16 operands at full FMA rate, with the same results
 as FFMA on the widened values and no widening instructions for weights or input. On GB300,
 PRMT, LOP3, F2FP and the packed fp32 FFMA2/FMUL2/HADD2.F32 issue at half rate, FHFMA.BF16 at
-full rate. A standalone GEMV of one expert set (8 experts' gate/up and down rows) measured
-bf16 21.9 us, MXFP8 13.2, NVFP4 15.0: NVFP4 is bound by the decode's ALU work (12.9 us
-without the PRMT/LOP3 decode), not by its 36 MB of DRAM traffic.
+full rate.
+
+Measured on GB300 with a standalone launch of one expert set (8 experts' gate/up and down rows;
+``QuantGemvKernel`` of commit a61f5c3b, since removed): bf16 21.9 us, MXFP8 13.2, NVFP4 15.0,
+NVFP4 12.9 without the PRMT/LOP3 decode and 19.4 with the planes gathered from global memory:
+NVFP4 is bound by its per-row loads, lookups and address math, not by its 36 MB of DRAM
+traffic. In the visit kernel an NVFP4 gate/up row tile takes about as long as a bf16 one
+(2.3 vs 2.5 us; ``mlp_half``).
 """
 
 import cutlass
@@ -46,7 +49,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel.core import (
 
 BF16 = "bf16"
 FORMATS = (BF16, quant.NVFP4, quant.MXFP8)
-LANE_WORDS = {BF16: 4, quant.NVFP4: 1, quant.MXFP8: 2}  # weight words per lane, row, subtile
+LANE_WORDS = {quant.NVFP4: 1, quant.MXFP8: 2}  # weight words per lane, row, subtile
 SUBTILE_WORDS = {f: 32 * w for f, w in LANE_WORDS.items()}
 # Tile-major scale words per subtile: 8 warps x blocks (each word: a block's 4 warp rows).
 BLOCKS = {fmt: TILE_K // columns for fmt, columns in quant.BLOCK_COLUMNS.items()}
@@ -183,8 +186,7 @@ def accumulate_subtile(
     """Add one 256-column subtile to ``acc`` (``(ROWS_PER_WARP, 2)`` fp32: the even and odd
     columns of the lane's rows ``row0 ..``). ``sW``: the stage's ``(32, words)`` Int32
     weights, this subtile from word ``word0``; ``xw``: the lane's 8 input columns as 4 bf16x2
-    words; ``scales``: the lane's tile-major scale word (its 4 rows' bytes; quantized
-    formats); ``planes``: flat Int32 NVFP4 magnitude planes, the expert's 256 x 4 words from
+    words; ``scales``: the lane's tile-major scale word (its 4 rows' bytes); ``planes``: flat Int32 NVFP4 magnitude planes, the expert's 256 x 4 words from
     ``plane_base``."""
     n = LANE_WORDS[fmt]
     for r in cutlass.range_constexpr(ROWS_PER_WARP):
@@ -192,13 +194,11 @@ def accumulate_subtile(
         cute.autovec_copy(cute.local_tile(sW[row0 + r, None], (n,), (word0 // n + lane,)), wq)
         if cutlass.const_expr(fmt == quant.MXFP8):
             words = mxfp8_bf16x8(wq[0], wq[1], mx_scale(scales, r))
-        elif cutlass.const_expr(fmt == quant.NVFP4):
+        else:
             lut = cute.make_rmem_tensor((4,), Int32)
             index = plane_base // 4 + scale_byte(scales, r)
             cute.autovec_copy(cute.local_tile(planes, (4,), (index,)), lut)
             words = nvfp4_bf16x8(wq[0], [lut[j] for j in range(4)])
-        else:
-            words = [wq[j] for j in range(4)]
         a0, a1 = acc[r, 0], acc[r, 1]
         for j in cutlass.range_constexpr(4):
             a0, a1 = fma_bf16x2(a0, a1, words[j], xw[j])

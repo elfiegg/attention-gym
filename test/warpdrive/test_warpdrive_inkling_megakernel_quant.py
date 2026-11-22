@@ -38,8 +38,9 @@ from attn_gym.warpdrive.examples.inkling_megakernel.quant import MXFP8, NVFP4
 from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import compile_visit_kernel
 
 MODEL = "thinkingmachines/Inkling-2-Mini"
-# MXFP8 scale bytes with finite products: an inf weight would make dot products NaN.
-MX_SCALES = (100, 130)
+# MXFP8 scale bytes down to the smallest with normal products, and finite ones: an inf weight
+# would make dot products NaN.
+MX_SCALES = (quant.MIN_MX_SCALE, 130)
 STEPS = 32
 COMPILES = (compile_visit_kernel, compile_msg_kernel, compile_head_kernel)
 
@@ -189,7 +190,8 @@ class ResidualRecorder:
 @pytest.mark.xdist_group("inkling-checkpoint")
 @torch.no_grad()
 def test_checkpoint_greedy_decode():
-    """``STEPS`` greedy steps after a prefill on Inkling 2 Mini, from one cache: the decoder on
+    """The prefill on the stored experts (``quant.forward_tokens``) equals the oracle's on
+    their dequantization; then ``STEPS`` greedy steps from equal caches: the decoder on
     the stored experts (NVFP4 layers 0-19, MXFP8 20-23) and on their bf16 dequantization give
     the same logits, visit outputs and residuals (all 48 visits, message visits included),
     caches and tokens bit for bit; positions compile nothing after the first step; a CUDA
@@ -204,9 +206,14 @@ def test_checkpoint_greedy_decode():
     dense = quant.dequantized_weights(weights)
     config = weights.config
     prompt = torch.arange(1000, 1040, device="cuda")
-    caches = [ref.InklingCache.empty(config, max_len=256)]
-    token = ref.forward_tokens(dense, prompt, 0, caches[0]).argmax().reshape(1)
-    caches.append(clone(caches[0]))
+    caches = [ref.InklingCache.empty(config, max_len=256) for _ in range(2)]
+    # The chat's prefill on the stored experts gives the oracle's logits and caches.
+    expected = ref.forward_tokens(dense, prompt, 0, caches[1])
+    logits = quant.forward_tokens(weights, prompt, 0, caches[0])
+    assert torch.equal(logits, expected)
+    for name, tensor in vars(caches[0]).items():
+        assert torch.equal(tensor, getattr(caches[1], name)), name
+    token = logits.argmax().reshape(1)
     decoders = [InklingDecoder(w) for w in (weights, dense)]
     recorders = []
     for decoder in decoders:

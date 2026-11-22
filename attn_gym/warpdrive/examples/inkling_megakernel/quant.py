@@ -292,15 +292,9 @@ def experts_out(config: ref.InklingConfig, w: ref.LayerWeights, x, experts, weig
 QUANTIZED = ref.Kernels(experts=experts_out)
 
 
-@torch.no_grad()
 def forward_tokens(
     weights: ref.InklingWeights, tokens: torch.Tensor, pos: int, cache: ref.InklingCache
 ) -> torch.Tensor:
     """``ref.forward_tokens`` (the last token's fp32 logits) on a model whose experts may be
     ``QuantExperts`` (``experts_out``), with the oracle's results."""
-    tokens = tokens.reshape(-1)
-    if pos + tokens.numel() > cache.max_len:
-        raise ValueError(f"positions up to {pos + tokens.numel()} exceed max_len {cache.max_len}")
-    positions = torch.arange(pos, pos + tokens.numel(), device=tokens.device)
-    h = ref.hidden_states(weights, tokens, positions, cache, start=pos, kernels=QUANTIZED)
-    return ref.logits_of(weights, h[-1:]).squeeze(0)
+    return ref.forward_tokens(weights, tokens, pos, cache, kernels=QUANTIZED)

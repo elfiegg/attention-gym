@@ -503,12 +503,12 @@ class InklingVisitMegakernel:
 
     def residual(self) -> torch.Tensor:
         """The fp32 ``(hidden,)`` post-attention residual of the last launch, from its tagged
-        words (valid until a launch of the same kind)."""
+        words (valid until the next launch)."""
         return tagged_values(self.last, "resid")
 
     def routed_experts(self, w: LayerWeights) -> torch.Tensor:
-        """The ``(experts_per_token,)`` experts the last launch (of layer weights ``w``) routed
-        to, ascending: the top-k of its published router logits' scores plus ``w``'s
+        """The ``(experts_per_token,)`` experts the last launch (which must be of layer weights
+        ``w``) routed to, ascending: the top-k of its published router logits' scores plus ``w``'s
         correction bias, recomputed here."""
         keys = torch.sigmoid(tagged_values(self.last, "logits")) + w.router_bias
         return keys.topk(self.last.op.top_k).indices.sort().values

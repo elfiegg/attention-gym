@@ -122,7 +122,7 @@ class MlpHalf:
         self.quantized = experts_format != BF16
         # Each kind's (GATEUP, DOWN) 256-column subtiles, and weight stages of stage_subtiles.
         self.expert_subtiles = (self.hidden_k_tiles, self.down_k_tiles)
-        self.stage_subtiles = STAGE_WORDS // SUBTILE_WORDS[experts_format]
+        self.stage_subtiles = STAGE_WORDS // SUBTILE_WORDS[experts_format] if self.quantized else 1
         self.expert_stages = tuple(-(-n // self.stage_subtiles) for n in self.expert_subtiles)
         # A ``meta`` stage: tile-major scale words of meta_subtiles subtiles (as many as the
         # gate/up rows have) and the expert's plane words (NVFP4).
