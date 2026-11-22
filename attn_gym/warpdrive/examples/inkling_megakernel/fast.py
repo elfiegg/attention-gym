@@ -21,6 +21,7 @@ from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
     LayerWeights,
     hidden_states,
     logits_of,
+    require_dense_experts,
 )
 
 
@@ -28,6 +29,7 @@ def grouped_experts(
     config: InklingConfig, w: LayerWeights, x: torch.Tensor, experts, weights
 ) -> torch.Tensor:
     """``ref.experts_out`` as grouped GEMMs over the routed rows."""
+    require_dense_experts(w)
     tokens, k = experts.shape
     flat = experts.reshape(-1)
     order = flat.argsort(stable=True)
