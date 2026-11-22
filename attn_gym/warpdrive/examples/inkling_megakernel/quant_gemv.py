@@ -186,8 +186,8 @@ def accumulate_subtile(
     """Add one 256-column subtile to ``acc`` (``(ROWS_PER_WARP, 2)`` fp32: the even and odd
     columns of the lane's rows ``row0 ..``). ``sW``: the stage's ``(32, words)`` Int32
     weights, this subtile from word ``word0``; ``xw``: the lane's 8 input columns as 4 bf16x2
-    words; ``scales``: the lane's tile-major scale word (its 4 rows' bytes); ``planes``: flat Int32 NVFP4 magnitude planes, the expert's 256 x 4 words from
-    ``plane_base``."""
+    words; ``scales``: the lane's tile-major scale word (its 4 rows' bytes); ``planes``: flat
+    Int32 NVFP4 magnitude planes, the expert's 256 x 4 words from ``plane_base``."""
     n = LANE_WORDS[fmt]
     for r in cutlass.range_constexpr(ROWS_PER_WARP):
         wq = cute.make_rmem_tensor((n,), Int32)
