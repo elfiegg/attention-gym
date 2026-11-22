@@ -66,10 +66,11 @@ class Torch:
 
     capturable = True
     quantized = False
+    compiled = False  # whether the step runs under torch.compile
 
-    def __init__(self, weights, cache: InklingCache, compile: bool = False):
+    def __init__(self, weights, cache: InklingCache):
         self.weights, self.cache = weights, cache
-        self.fn = torch.compile(decode_step) if compile else decode_step
+        self.fn = torch.compile(decode_step) if self.compiled else decode_step
 
     def step(self, token: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         return self.fn(self.weights, token, pos, self.cache)
@@ -100,8 +101,7 @@ class MegakernelBf16(Megakernel):
 class Compile(Torch):
     """``Torch`` under torch.compile."""
 
-    def __init__(self, weights, cache: InklingCache):
-        super().__init__(weights, cache, compile=True)
+    compiled = True
 
 
 BACKENDS = {

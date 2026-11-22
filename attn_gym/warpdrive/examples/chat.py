@@ -320,7 +320,8 @@ def main(
     backend: str | None = typer.Option(
         None,
         help="decode backend; each family lists its own (Qwen: megakernel, compile; Inkling: "
-        "reference, torch, compile). Default: the family's DEFAULT_BACKEND.",
+        "megakernel, megakernel-bf16, reference, torch, compile). Default: the family's "
+        "DEFAULT_BACKEND.",
     ),
     engine: str = typer.Option("cuda_core", help="Qwen megakernel engine: cuda_core or tcgen05"),
     max_len: int = typer.Option(4096, help="cache capacity (tokens)"),
