@@ -21,12 +21,14 @@ The layout follows the GEMV: 32-row x 256-column subtiles, warp w of 8 owning ro
   i for fp8 scale byte s as byte planes: four int32 words, the low bytes of codes 0-3, of
   4-7, then the high bytes of codes 0-3, of 4-7; the code's sign flips the value's sign bit.
   The table evaluates ``ref.dequantize_experts``' fp32 operations and negation is exact, so
-  the decode is exact for every scale byte and factor. The per-expert factor stays fp32
-  (amax / denominator) as in the oracle; HF's loader rounds amax to bf16 first.
+  the decode is exact for every non-NaN scale byte and finite factor; ``from_checkpoint``
+  rejects the others (a NaN's sign bit would differ from the oracle's). The per-expert factor
+  stays fp32 (amax / denominator) as in the oracle; HF's loader rounds amax to bf16 first.
 - MXFP8 weights are the checkpoint's e4m3 bytes; the kernel converts them to bf16 and
   multiplies by the bf16 power of two ``2 ** (s - 127)`` of the scale byte s. That is the
-  oracle's value whenever the product is a normal number, which ``from_checkpoint`` checks
-  (every scale byte >= 10; the checkpoint's are 113 .. 118).
+  oracle's value whenever the product is a normal number or overflows, which
+  ``from_checkpoint`` checks (every scale byte in [10, 254]: 255 is E8M0's NaN; the
+  checkpoint's are 113 .. 118).
 - Scales of both formats are tile-major bytes ``(experts, rows / 32, subtiles, 8, blocks, 4)``:
   per subtile and warp, block by block, the warp's 4 rows; a lane reads its 4 rows' scales as
   one word. ``blocks`` is 16 (NVFP4: 16 columns each) or 8 (MXFP8: 32 columns). A partial last
@@ -174,9 +176,15 @@ class QuantExperts:
                     f"MXFP8 scale bytes below {MIN_MX_SCALE} give subnormal products, which the "
                     "kernel's bf16 multiply does not reproduce"
                 )
+            if int(scale.max()) == 255:
+                raise ValueError("MXFP8 scale byte 255 is NaN (E8M0)")
             scales = tile_scales(scale, BLOCK_COLUMNS[MXFP8])
             return cls(MXFP8, weight.shape[2], weight.view(torch.uint8), scales)
         factor = amax.float() / denominator.float()
+        if not bool(torch.isfinite(factor).all()):
+            raise ValueError("NVFP4 amax / denominator must be finite")
+        if bool(scale.float().isnan().any()):
+            raise ValueError("NVFP4 scales must not be NaN")
         encoded = torch.empty_like(weight, dtype=torch.uint8)
         for start in range(0, experts, CHUNK):
             encoded[start : start + CHUNK] = encode_nvfp4(weight[start : start + CHUNK])

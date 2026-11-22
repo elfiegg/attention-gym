@@ -57,6 +57,27 @@ def test_mxfp8_rejects_subnormal_scales():
         QuantExperts.from_checkpoint(weight, scale, None, None)
 
 
+@pytest.mark.parametrize("field,match", [("scale", "NaN"), ("amax", "finite")])
+def test_nvfp4_rejects_nan_scales_and_non_finite_factors(field, match):
+    """NaN scales or factors decode to NaNs whose sign bits differ from the oracle's."""
+    require_cuda()
+    weight, scale, amax, denominator = random_checkpoint(NVFP4, 32, 256, seed=0, experts=1)
+    if field == "scale":
+        scale.view(torch.uint8)[0, 0, 0] = 0x7F
+    else:
+        amax[0] = float("inf")
+    with pytest.raises(ValueError, match=match):
+        QuantExperts.from_checkpoint(weight, scale, amax, denominator)
+
+
+def test_mxfp8_rejects_nan_scales():
+    require_cuda()
+    weight, scale, _, _ = random_checkpoint(MXFP8, 32, 256, seed=0, experts=1)
+    scale[0, 0, 0] = 255
+    with pytest.raises(ValueError, match="NaN"):
+        QuantExperts.from_checkpoint(weight, scale, None, None)
+
+
 def test_dense_paths_reject_quantized_experts():
     require_cuda()
     q = QuantExperts.from_checkpoint(*random_checkpoint(NVFP4, 32, 256, seed=1, experts=2))
