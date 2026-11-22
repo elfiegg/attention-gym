@@ -512,7 +512,8 @@ class InklingVisitMegakernel:
         ``w``) routed to, ascending: the top-k of its published router logits' scores plus ``w``'s
         correction bias, recomputed here."""
         keys = torch.sigmoid(tagged_values(self.last, "logits")) + w.router_bias
-        return keys.topk(self.last.op.top_k).indices.sort().values
+        order = torch.sort(keys, descending=True, stable=True).indices
+        return order[: self.last.op.top_k].sort().values
 
 
 def tagged_values(launch: Launch, name: str) -> torch.Tensor:
