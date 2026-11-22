@@ -1,6 +1,7 @@
 """Inkling 2 Mini batch-one decode timings in CUDA graphs: each launch kind of the megakernel
-decode step (``megakernel.InklingDecoder``) and the whole step, against the torch step
-(``fast.decode_step``).
+decode step (``megakernel.InklingDecoder``) and the whole step, with the checkpoint's experts
+as stored (``quant.load_quantized_inkling_weights``) and, in the same process, dequantized to
+bf16 (``--bf16``, the default; also times the torch step ``fast.decode_step`` on them).
 
     python -m attn_gym.warpdrive.examples.inkling_megakernel.bench --context 1100
 
@@ -30,7 +31,7 @@ from attn_gym.warpdrive.examples.bench_support import (
     provenance,
     settle,
 )
-from attn_gym.warpdrive.examples.inkling_megakernel import ref
+from attn_gym.warpdrive.examples.inkling_megakernel import quant, ref
 from attn_gym.warpdrive.examples.inkling_megakernel.fast import decode_step
 from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import InklingDecoder
 
@@ -104,6 +105,18 @@ def launch_kinds(config: ref.InklingConfig) -> dict[str, tuple[str, int, int]]:
     return kinds
 
 
+def record_calls(decoder: InklingDecoder, token, pos, cache) -> dict[str, list]:
+    """Every launch of one ``decoder`` step, by runner (``visit``, ``msg``, ``head``), ready to
+    replay."""
+    calls = {name: [] for name in ("visit", "msg", "head")}
+    for name, recorded in calls.items():
+        setattr(decoder, name, Recorder(getattr(decoder, name), recorded))
+    decoder(token, pos, cache)
+    for name in calls:
+        setattr(decoder, name, getattr(decoder, name).runner)
+    return calls
+
+
 @torch.no_grad()
 def main(
     context: Annotated[int, typer.Option(help="prefilled tokens; the decoded position")] = 1100,
@@ -111,48 +124,66 @@ def main(
     reps: Annotated[int, typer.Option(help="calls per launch graph replay")] = 20,
     rounds: Annotated[int, typer.Option(help="interleaved timing rounds (odd)")] = 5,
     iters: Annotated[int, typer.Option(help="replays per graph per round")] = 50,
+    bf16: Annotated[bool, typer.Option(help="also time bf16 experts and the torch step")] = True,
     checkpoint: str = "thinkingmachines/Inkling-2-Mini",
     json_out: Annotated[Path | None, typer.Option(help="write results, provenance")] = None,
 ):
-    weights = ref.load_inkling_weights(checkpoint)
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    weights = quant.load_quantized_inkling_weights(checkpoint)
+    memory = {"quantized": torch.cuda.memory_allocated() - before}
     config = weights.config
     cache = ref.InklingCache.empty(config, max_len)
     gen = torch.Generator(device="cuda").manual_seed(0)
     prompt = torch.randint(1000, 100000, (context,), device="cuda", generator=gen)
-    token = ref.forward_tokens(weights, prompt, 0, cache).argmax().reshape(1)
+    token = quant.forward_tokens(weights, prompt, 0, cache).argmax().reshape(1)
     pos = torch.tensor([context], device="cuda", dtype=torch.int32)
-    decoder = InklingDecoder(weights)
-    calls = {name: [] for name in ("visit", "msg", "head")}
-    for name, recorded in calls.items():
-        setattr(decoder, name, Recorder(getattr(decoder, name), recorded))
-    decoder(token, pos, cache)
-    for name in calls:
-        setattr(decoder, name, getattr(decoder, name).runner)
+    models = {"quantized": weights}
+    if bf16:
+        allocated = torch.cuda.memory_allocated()
+        models["bf16"] = dense = quant.dequantized_weights(weights)
+        memory["bf16"] = memory["quantized"] + torch.cuda.memory_allocated() - allocated
 
     kinds = launch_kinds(config)
-    graphs = {
-        kind: capture(calls[runner][call], reps) for kind, (runner, call, _) in kinds.items()
-    }
-    graphs["decode step: torch"] = capture(partial(decode_step, weights, token, pos, cache), 1)
-    graphs["decode step: megakernel"] = capture(partial(decoder, token, pos, cache), 1)
+    graphs = {}
+    for name, model in models.items():
+        decoder = InklingDecoder(model)
+        calls = record_calls(decoder, token, pos, cache)
+        for kind, (runner, call, _) in kinds.items():
+            graphs[f"{name}: {kind}"] = capture(calls[runner][call], reps)
+        graphs[f"decode step: megakernel, {name}"] = capture(
+            partial(decoder, token, pos, cache), 1
+        )
+    if bf16:
+        graphs["decode step: torch, bf16"] = capture(
+            partial(decode_step, dense, token, pos, cache), 1
+        )
     results = time_graphs(graphs, rounds, iters)
-    print(f"{'launch kind':40s} {'us/launch':>10s} {'per step':>9s} {'us/step':>9s}")
-    launches = 0.0
-    for kind, (_, _, count) in kinds.items():
-        launches += count * results[kind]
-        print(f"{kind:40s} {results[kind]:10.1f} {count:9d} {count * results[kind]:9.1f}")
-    step = results["decode step: megakernel"]
-    print(f"{'launches (sum)':40s} {'':10s} {'':9s} {launches:9.1f}")
-    print(f"{'gaps (step - sum)':40s} {'':10s} {'':9s} {step - launches:9.1f}")
-    for name in ("decode step: torch", "decode step: megakernel"):
-        print(f"{name:40s} {results[name]:10.1f} us")
+    for name in models:
+        print(f"{name + ' experts: launch kind':40s} {'us/launch':>10s} {'per step':>9s} "
+              f"{'us/step':>9s}")  # fmt: skip
+        launches = 0.0
+        for kind, (_, _, count) in kinds.items():
+            us = results[f"{name}: {kind}"]
+            launches += count * us
+            print(f"{kind:40s} {us:10.1f} {count:9d} {count * us:9.1f}")
+        step = results[f"decode step: megakernel, {name}"]
+        print(f"{'launches (sum)':40s} {'':10s} {'':9s} {launches:9.1f}")
+        print(f"{'gaps (step - sum)':40s} {'':10s} {'':9s} {step - launches:9.1f}")
+        print(f"{'model weights (GB)':40s} {memory[name] / 1e9:10.1f}")
+    for name, us in results.items():
+        if name.startswith("decode step"):
+            print(f"{name:40s} {us:10.1f} us")
     if json_out is not None:
         here = Path(__file__).parent
         sources = {p.stem: p for p in sorted(here.glob("*.py"))}
         arguments = {"context": context, "max_len": max_len, "reps": reps, "rounds": rounds,
-                     "iters": iters}  # fmt: skip
+                     "iters": iters, "bf16": bf16}  # fmt: skip
         json_out.write_text(
-            json.dumps({"results_us": results, **provenance(sources, arguments)}, indent=2)
+            json.dumps(
+                {"results_us": results, "weight_bytes": memory, **provenance(sources, arguments)},
+                indent=2,
+            )
         )
 
 
