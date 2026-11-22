@@ -822,12 +822,14 @@ def forward_tokens(
     cache: InklingCache,
     *,
     all_logits: bool = False,
+    kernels: "Kernels | None" = None,
 ) -> torch.Tensor:
     """Prefill or decode ``tokens`` at positions ``pos ..``; returns the last token's fp32
-    logits (``all_logits``: every token's, (tokens, vocab))."""
+    logits (``all_logits``: every token's, (tokens, vocab)). ``kernels``: as
+    ``hidden_states``'."""
     tokens = tokens.reshape(-1)
     if pos + tokens.numel() > cache.max_len:
         raise ValueError(f"positions up to {pos + tokens.numel()} exceed max_len {cache.max_len}")
     positions = torch.arange(pos, pos + tokens.numel(), device=tokens.device)
-    h = hidden_states(weights, tokens, positions, cache, start=pos)
+    h = hidden_states(weights, tokens, positions, cache, start=pos, kernels=kernels)
     return logits_of(weights, h if all_logits else h[-1:]).squeeze(0)
