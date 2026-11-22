@@ -157,6 +157,34 @@ def fetch_uniform(segments, out, epoch, backoff: cutlass.Constexpr = 0):
 
 
 @cute.jit
+def conv_inputs(ring, taps, col, pos, kernel: cutlass.Constexpr):
+    """Column ``col``'s inputs of a post-attention or post-MLP short convolution (``post_conv``):
+    its fp32 ``(channel, kernel)`` taps and the ``kernel - 1`` ring rows before position
+    ``pos``, oldest first (rows before position 0 are read but unused)."""
+    weights = cute.make_rmem_tensor((kernel,), Float32)
+    past = cute.make_rmem_tensor((kernel - 1,), BFloat16)
+    for j in cutlass.range_constexpr(kernel):
+        weights[j] = taps[col, j]
+    for j in cutlass.range_constexpr(kernel - 1):
+        past[j] = ring[(pos - (kernel - 1) + j + RING) % RING, col]
+    return weights, past
+
+
+@cute.jit
+def post_conv(ring, weights, past, col, pos, y, kernel: cutlass.Constexpr):
+    """``ref.short_conv`` of column ``col`` at position ``pos`` on the bf16 value ``y``, from
+    ``conv_inputs``: writes ``y`` to the ring row of ``pos``, then returns the bf16
+    ``(conv + y) / sqrt(kernel + 1)``, the last tap on ``y`` and positions before 0 zero."""
+    ring[pos % RING, col] = BFloat16(y)
+    conv = Float32(0.0)
+    for j in cutlass.range_constexpr(kernel - 1):
+        src = pos - (kernel - 1) + j  # >= -(kernel - 1): positions before 0 read zero
+        conv = conv + weights[j] * cutlass.select_(src >= 0, Float32(past[j]), Float32(0.0))
+    conv = conv + weights[kernel - 1] * y
+    return bf16_round((conv + y) * fp32_reciprocal(math.sqrt(kernel + 1)))
+
+
+@cute.jit
 def load_tiles(w, atom, tiles, row, k0, count: cutlass.Constexpr, buffer: cutlass.Constexpr):
     """``count`` stages of tiles ``(row, k0 + k)`` into the ring's ``buffer`` view; weights and
     KV rows are read once per launch, hence evict-first in L2."""

@@ -48,10 +48,11 @@ from cutlass import BFloat16, Float32, Int32, Int64, cute
 from attn_gym.warpdrive.cache import make_fake_compact_tensor
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     BACKOFF_NS,
-    RING,
+    conv_inputs,
     fetch_uniform,
     fp32_reciprocal,
     load_tiles,
+    post_conv,
     tma_atom,
 )
 from attn_gym.warpdrive.examples.inkling_megakernel.quant_gemv import (
@@ -59,8 +60,8 @@ from attn_gym.warpdrive.examples.inkling_megakernel.quant_gemv import (
     BLOCKS,
     FORMATS,
     LANE_WORDS,
-    SUBTILE_WORDS,
     NVFP4,
+    SUBTILE_WORDS,
     accumulate_subtile,
 )
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
@@ -322,23 +323,16 @@ class MlpHalf:
         and written to the convolution ring at the position, then the post-MLP convolution
         ``(conv + y) / sqrt(kernel + 1)`` (bf16) plus the attention half's residual."""
         k = self.top_k
+        pos = Int32(p.pos[0])
+        # The weights and ring rows load before the poll (their latency overlaps it).
+        weights, past = conv_inputs(p.ring_mlp, p.mlp_conv, col, pos, self.conv_kernel)
         vals = cute.make_rmem_tensor((k + 1,), Float32)
         segments = [(p.down, s * self.hidden + col, 1) for s in range(k)]
         fetch(segments + [(p.resid, col, 1)], vals, epoch)
         acc = Float32(0.0)
         for s in cutlass.range_constexpr(k):
             acc = acc + vals[s] * p.route[1, k + s]
-        y = bf16_round(acc)
-        pos = Int32(p.pos[0])
-        p.ring_mlp[pos % RING, col] = BFloat16(y)
-        taps = self.conv_kernel
-        conv = Float32(0.0)
-        for j in cutlass.range_constexpr(taps - 1):
-            src = pos - (taps - 1) + j  # >= -(taps - 1): positions before 0 read zero
-            past = Float32(p.ring_mlp[(src + RING) % RING, col])
-            conv = conv + p.mlp_conv[col, j] * cutlass.select_(src >= 0, past, Float32(0.0))
-        conv = conv + p.mlp_conv[col, taps - 1] * y
-        z = bf16_round((conv + y) * fp32_reciprocal(math.sqrt(taps + 1)))
+        z = post_conv(p.ring_mlp, weights, past, col, pos, bf16_round(acc), self.conv_kernel)
         p.out[col] = BFloat16(vals[k] + z)
 
     @cute.jit

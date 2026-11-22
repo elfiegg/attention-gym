@@ -59,10 +59,12 @@ from cutlass import BFloat16, Float32, Int32, cute
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     MAX_BLOCKS,
     RING,
+    conv_inputs,
     fetch_uniform,
     fp32,
     fp32_reciprocal,
     load_tiles,
+    post_conv,
     tma_atom,
 )
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
@@ -758,14 +760,8 @@ class AttentionHalf:
         of the splits' partials in split order), written to the convolution ring at the
         position, then the post-attention convolution ``(conv + y) / sqrt(kernel + 1)`` (bf16)
         plus ``h`` (unless the layer starts a block), published to ``resid``."""
-        taps = self.conv_kernel
         # The weights, ring rows and input load before the poll (their latency overlaps it).
-        weights = cute.make_rmem_tensor((taps,), Float32)
-        past = cute.make_rmem_tensor((taps - 1,), BFloat16)
-        for j in cutlass.range_constexpr(taps):
-            weights[j] = p.attn_conv[col, j]
-        for j in cutlass.range_constexpr(taps - 1):
-            past[j] = p.ring_attn[(pos - (taps - 1) + j + RING) % RING, col]
+        weights, past = conv_inputs(p.ring_attn, p.attn_conv, col, pos, self.conv_kernel)
         h = Float32(0.0)
         if p.boundary == 0:  # (layer 0's h may still be in CTA 0's embedding store)
             h = Float32(p.h[col])
@@ -774,14 +770,7 @@ class AttentionHalf:
         acc = vals[0]
         for s in cutlass.range_constexpr(1, O_SPLITS):
             acc = acc + vals[s]
-        y = bf16_round(acc)
-        p.ring_attn[pos % RING, col] = BFloat16(y)
-        conv = Float32(0.0)
-        for j in cutlass.range_constexpr(taps - 1):
-            src = pos - (taps - 1) + j  # >= -(taps - 1): positions before 0 read zero
-            conv = conv + weights[j] * cutlass.select_(src >= 0, Float32(past[j]), Float32(0.0))
-        conv = conv + weights[taps - 1] * y
-        z = bf16_round((conv + y) * fp32_reciprocal(math.sqrt(taps + 1)))
+        z = post_conv(p.ring_attn, weights, past, col, pos, bf16_round(acc), self.conv_kernel)
         publish(p.resid, col, cutlass.select_(p.boundary != 0, z, h + z), epoch)
 
     # ------------------------------------------------------------- TMA atoms
