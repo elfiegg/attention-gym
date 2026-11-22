@@ -2,22 +2,27 @@
 
     python -m attn_gym.warpdrive.examples.inkling_megakernel.chat --backend reference --prompt "Hi"
 
-Prefill runs the PyTorch oracle (``ref.forward_tokens``, one forward pass into the caches).
-Backends:
+Prefill runs the PyTorch oracle (``quant.forward_tokens``: ``ref.forward_tokens``, one forward
+pass into the caches, dequantizing only the routed experts of a quantized model). Backends:
 
 - ``reference``: the oracle, one eager step at a time (a host sync per step: no CUDA graph);
 - ``torch``: ``fast.decode_step`` (the oracle's dataflow on capturable kernels) in CUDA graphs;
 - ``compile``: the same step under torch.compile (minutes to compile cold), in CUDA graphs;
 - ``megakernel`` (default): the step as warpdrive megakernel launches only
   (``megakernel.InklingDecoder``: one per visit, one per core pass's messages, one for the LM
-  head), in CUDA graphs. It needs an SM100-family GPU and CuTeDSL; elsewhere use ``torch``.
+  head), in CUDA graphs, streaming the checkpoint's experts as stored (NVFP4 and MXFP8,
+  ``quant.load_quantized_inkling_weights``: 19 GB of weights). It needs an SM100-family GPU
+  and CuTeDSL; elsewhere use ``torch``;
+- ``megakernel-bf16``: the same launches on the experts dequantized to bf16 (49 GB), with the
+  same tokens bit for bit.
+
+The other backends load bf16 experts.
 
 Replies are sequences of ``<|message_model|><|content_X|>...<|end_message|>`` parts, ``X`` being
 ``thinking`` or ``text``, closed by ``<|content_model_end_sampling|>``; the reply shows thinking
 parts between ``[thinking]`` markers and keeps both for the next turn's history.
 """
 
-import functools
 import re
 from pathlib import Path
 
@@ -25,6 +30,7 @@ import torch
 import typer
 
 from attn_gym.warpdrive.examples.chat import SYNC_EVERY, ChatOptions, run
+from attn_gym.warpdrive.examples.inkling_megakernel import quant
 from attn_gym.warpdrive.examples.inkling_megakernel.fast import decode_step
 from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
     CONV_RING,
@@ -46,6 +52,7 @@ class Reference:
     """One eager decode step of the oracle."""
 
     capturable = False
+    quantized = False  # whether the backend takes the checkpoint's experts as stored
 
     def __init__(self, weights, cache: InklingCache):
         self.weights, self.cache = weights, cache
@@ -58,6 +65,7 @@ class Torch:
     """``fast.decode_step``, captured by the chat's CUDA graphs."""
 
     capturable = True
+    quantized = False
 
     def __init__(self, weights, cache: InklingCache, compile: bool = False):
         self.weights, self.cache = weights, cache
@@ -72,6 +80,7 @@ class Megakernel:
     CUDA graphs."""
 
     capturable = True
+    quantized = True
 
     def __init__(self, weights, cache: InklingCache):
         from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import InklingDecoder
@@ -82,11 +91,25 @@ class Megakernel:
         return self.decoder(token, pos, self.cache)
 
 
+class MegakernelBf16(Megakernel):
+    """``Megakernel`` on the experts dequantized to bf16."""
+
+    quantized = False
+
+
+class Compile(Torch):
+    """``Torch`` under torch.compile."""
+
+    def __init__(self, weights, cache: InklingCache):
+        super().__init__(weights, cache, compile=True)
+
+
 BACKENDS = {
     "reference": Reference,
     "torch": Torch,
-    "compile": functools.partial(Torch, compile=True),
+    "compile": Compile,
     "megakernel": Megakernel,
+    "megakernel-bf16": MegakernelBf16,
 }
 DEFAULT_BACKEND = "megakernel"
 
@@ -115,7 +138,9 @@ class InklingChatModel:
         from transformers import AutoTokenizer
 
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-        self.weights = load_inkling_weights(checkpoint)
+        backend = BACKENDS[options.backend]
+        load = quant.load_quantized_inkling_weights if backend.quantized else load_inkling_weights
+        self.weights = load(checkpoint)
         # The chat decodes up to SYNC_EVERY steps past a stop token, then resumes at the stop
         # token's position: its convolutions read the kernel - 1 earlier ring rows, which those
         # over-run steps must not have overwritten.
@@ -123,7 +148,7 @@ class InklingChatModel:
             raise ValueError(f"CONV_RING {CONV_RING} is too short for SYNC_EVERY {SYNC_EVERY}")
         self.max_len = options.max_len
         self.cache = InklingCache.empty(self.weights.config, options.max_len)
-        self.backend = BACKENDS[options.backend](self.weights, self.cache)
+        self.backend = backend(self.weights, self.cache)
         self.label = f"the {options.backend} backend"
         effort = options.reasoning_effort
         self.effort = effort if effort in EFFORTS else float(effort)
@@ -140,7 +165,8 @@ class InklingChatModel:
         return self.tokenizer(text, add_special_tokens=False).input_ids
 
     def prefill(self, ids: list[int], start: int) -> torch.Tensor:
-        return forward_tokens(self.weights, torch.tensor(ids, device="cuda"), start, self.cache)
+        tokens = torch.tensor(ids, device="cuda")
+        return quant.forward_tokens(self.weights, tokens, start, self.cache)
 
     def parts(self, ids: list[int]) -> list[tuple[str, str, bool]]:
         return reply_parts(self.tokenizer.decode(ids, skip_special_tokens=False))
@@ -162,7 +188,7 @@ class InklingChatModel:
 def check_options(options: ChatOptions):
     if options.backend not in BACKENDS:
         raise typer.BadParameter(f"Inkling backends: {sorted(BACKENDS)}, got {options.backend!r}")
-    if options.backend == "megakernel" and options.max_len % 64:
+    if options.backend.startswith("megakernel") and options.max_len % 64:
         raise typer.BadParameter("--max-len must be a multiple of 64 (the megakernel's KV block)")
     effort = options.reasoning_effort
     if effort not in EFFORTS:
