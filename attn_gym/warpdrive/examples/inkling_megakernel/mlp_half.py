@@ -36,6 +36,7 @@ from cutlass import BFloat16, Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync
 
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
+    BACKOFF_NS,
     RING,
     fetch_uniform,
     fp32_reciprocal,
@@ -104,7 +105,8 @@ class MlpHalf:
             w = load_tiles(w, p.tma_mlp[0], p.gmem_mlp[0], a, 0, self.hidden_k_tiles, "W")
         else:
             if routed == 0:
-                self.route(p, lane, epoch, 0)
+                with self.trace_region("route"):
+                    self.route(p, lane, epoch, 0)
                 routed = Int32(1)
             w = self.load_expert(p, w, op, a, Int32(p.route[0, b]))
         return w, routed
@@ -235,11 +237,12 @@ class MlpHalf:
         their scores renormalized over the top k and scaled by ``route_scale``. Each round
         takes the warp's largest remaining key; the slots come from a scan of the chosen
         counts, so no sort is needed. The logits are polled warp-uniformly
-        (``fetch_uniform``): the shuffles that follow need every lane."""
+        (``fetch_uniform``): the shuffles that follow need every lane. The load warp polls them
+        from the end of its CTA's attention stages, so it backs off between polls."""
         n = self.experts // 32  # lane l holds experts n*l .. n*l + n - 1
         k = self.top_k
         logits = cute.make_rmem_tensor((n,), Float32)
-        fetch_uniform([(p.logits, n * lane, n)], logits, epoch)
+        fetch_uniform([(p.logits, n * lane, n)], logits, epoch, BACKOFF_NS)
         keys = cute.make_rmem_tensor((n,), Float32)
         scores = cute.make_rmem_tensor((n,), Float32)
         for i in cutlass.range_constexpr(n):

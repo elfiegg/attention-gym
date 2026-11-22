@@ -70,6 +70,7 @@ from attn_gym.warpdrive.examples.inkling_megakernel.attn_half import (
     V,
 )
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
+    BACKOFF_NS,
     GATE_TILES,
     GATEMIX,
     MAX_BLOCKS,
@@ -104,6 +105,9 @@ from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     unpack_tagged,
 )
 
+# Register budgets (setmaxnreg per warpgroup; the launch pads to 12 warps, 168 registers each):
+# 9 warps would cap every warp at 168, 3 warps sharing a sub-partition's 16384 registers.
+COMPUTE_REGS, LOAD_REGS = 232, 40
 # VisitParams fields passed to the kernel as one tuple of argument tensors, in this order.
 TENSOR_ARGS = (
     "trace_buffer", "state", "pos", "token", "embed", "embed_norm", "h", "attn_query",
@@ -271,7 +275,7 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
 
     # ------------------------------------------------------------------ roles
 
-    @role(warps=COMPUTE_WARPS)
+    @role(warps=COMPUTE_WARPS, regs=LOAD_REGS)
     @cute.jit
     def load(self, p: VisitParams, *, w: Producer, work: WorkCursor):
         w = w.views(W=p.sW, KV=p.sKV)
@@ -291,7 +295,7 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
             work.advance()
         return w, work
 
-    @role(warps=range(COMPUTE_WARPS))
+    @role(warps=range(COMPUTE_WARPS), regs=COMPUTE_REGS)
     @cute.jit
     def compute(self, p: VisitParams, *, w: Consumer, work: WorkCursor, me: Local):
         tid, warp, lane = me.tid, me.warp, me.lane
@@ -363,12 +367,23 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
         """Every CTA, before its first MLP row: the MLP input ``xs[0]`` from the block residual
         of the MLP query over the MLP's blocks (the attention's, plus h when the layer starts a
         block; at layer 0 the recomputed embedding) and the attention's residual, polled from
-        its tagged words. The blocks and embedding load before the poll."""
+        its tagged words. The blocks and embedding load before the wait: warp 0 polls one word
+        of each o_proj reducer's row tile, with backoff (a CTA waits here through attention's
+        tail: every thread polling every word measured ~1 us slower attention rows on GB300),
+        then the CTA fetches the whole residual."""
         per = self.hidden // COMPUTE_THREADS
         num_blocks = p.num_blocks + p.boundary
         x = self.load_states(p, num_blocks, None, tid)
         if p.embed_input != 0:
             self.embed_token(p, x, 0, False, tid, warp, lane)
+        if warp == 0:
+            rounds = -(-self.row_tiles // 32)
+            last = (self.row_tiles - 1) * ROWS
+            sentinels = cute.make_rmem_tensor((rounds,), Float32)
+            segments = [(p.resid, cutlass.min((lane + 32 * i) * ROWS, last), 1)
+                        for i in range(rounds)]  # fmt: skip
+            fetch_uniform(segments, sentinels, epoch, BACKOFF_NS)
+        self.csync.sync()
         resid = cute.make_rmem_tensor((per,), Float32)
         fetch_uniform([(p.resid, r * COMPUTE_THREADS + tid, 1) for r in range(per)], resid, epoch)
         for r in cutlass.range_constexpr(per):

@@ -27,7 +27,9 @@ from dataclasses import dataclass
 
 import cutlass
 from cutlass import BFloat16, Float32, Int32, Int64, cute
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync
+from cutlass.cutlass_dsl import dsl_user_op
 
 from attn_gym.warpdrive import WarpSpecialized
 from attn_gym.warpdrive.cache import make_fake_compact_tensor
@@ -62,6 +64,8 @@ GATE_SPLITS = 3  # MSGDOWN split-K: k tiles of the x half per item = hidden / 25
 MIX_STAGES = 2  # GATEMIX: 32-row stages of [F | G] per item
 # MIX: the prologue's state scale factors (STATES), then each query's state weights (STATES).
 MIX_FLOATS = STATES * 4
+# Sleep between failed polls of a wait that spans other CTAs' work (fetch_uniform's backoff).
+BACKOFF_NS = 100
 
 
 def fp32(x: float) -> float:
@@ -84,11 +88,30 @@ def scratch_offsets(shapes: dict[str, int]) -> tuple[dict[str, int], int]:
     return offsets, offset
 
 
+@dsl_user_op
+def nanosleep(ns: int, *, loc=None, ip=None):
+    """Suspend the thread for about ``ns`` nanoseconds (PTX ``nanosleep``; the hardware picks a
+    duration in [0, 2 * ns])."""
+    llvm.inline_asm(
+        None,
+        [],
+        f"nanosleep.u32 {ns};",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 @cute.jit
-def fetch_uniform(segments, out, epoch):
+def fetch_uniform(segments, out, epoch, backoff: cutlass.Constexpr = 0):
     """``fetch`` polled until every lane of the warp has all its words, so the lanes leave the
     loop together: lanes leaving a divergent poll loop one by one and then waiting at a shuffle
-    for the rest measured a fixed ~17k-cycle stall. Every lane of the warp must call it."""
+    for the rest measured a fixed ~17k-cycle stall. Every lane of the warp must call it. With
+    ``backoff``, a failed poll sleeps about that many nanoseconds: long waits then issue few
+    L2 requests while other CTAs' work runs."""
     ready = Int32(0)
     while ready == 0:
         mine = Int32(1)
@@ -102,6 +125,9 @@ def fetch_uniform(segments, out, epoch):
                 mine = mine & Int32(tag == epoch)
             start += count
         ready = Int32(cute.arch.vote_all_sync(mine != 0))
+        if cutlass.const_expr(backoff > 0):
+            if ready == 0:
+                nanosleep(backoff)
 
 
 @cute.jit

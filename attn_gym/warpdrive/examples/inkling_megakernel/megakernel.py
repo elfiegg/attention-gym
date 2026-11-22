@@ -341,6 +341,8 @@ class InklingVisitMegakernel:
             for full in (False, True)
             for messages in (False, True)
         }
+        for w in layers:  # the launch streams bf16 experts (quantized ones need quant_gemv)
+            ref.require_dense_experts(w)
         self.args = {id(w): VisitLayer.of(config, w) for w in layers}
         self.layers = layers  # keeps the ids of ``args`` valid
         hidden = config.hidden_size
