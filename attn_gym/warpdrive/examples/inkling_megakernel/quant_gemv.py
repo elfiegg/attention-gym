@@ -26,12 +26,14 @@ as FFMA on the widened values and no widening instructions for weights or input.
 PRMT, LOP3, F2FP and the packed fp32 FFMA2/FMUL2/HADD2.F32 issue at half rate, FHFMA.BF16 at
 full rate.
 
-Measured on GB300 with a standalone launch of one expert set (8 experts' gate/up and down rows;
-``QuantGemvKernel`` of commit a61f5c3b, since removed): bf16 21.9 us, MXFP8 13.2, NVFP4 15.0,
+Measured on GB300 (2026-11-21) with a standalone launch of one expert set (8 experts' gate/up
+and down rows; ``QuantGemvKernel`` of commit a61f5c3b, since removed): bf16 21.9 us, MXFP8 13.2,
+NVFP4 15.0,
 NVFP4 12.9 without the PRMT/LOP3 decode and 19.4 with the planes gathered from global memory:
 NVFP4 is bound by its per-row loads, lookups and address math, not by its 36 MB of DRAM
 traffic. In the visit kernel an NVFP4 gate/up row tile takes about as long as a bf16 one
-(2.3 vs 2.5 us; ``mlp_half``).
+(2.3 vs 2.5 us in a globaltimer trace of visit 1 at context 1100; GB300, 2026-11-21, commit
+f6a11d11).
 """
 
 import cutlass

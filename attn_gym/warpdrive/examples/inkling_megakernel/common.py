@@ -19,8 +19,9 @@ inputs (``gather``) before their first own row of the half.
 
 Sized so that a half's message items (126 in attention, 42 in the MLP) fit one per CTA:
 every GATEMIX item then waits for the last MSGDOWN item, not for another GATEMIX item of its CTA.
-On GB300 at Inkling 2 Mini's shapes the gather of a sliding attention half ends ~6.5 us after
-the prologue (whole-K MSGDOWN tiles and 32-row GATEMIX items, two on some CTAs: ~9 us).
+In a globaltimer trace of a sliding attention launch with messages (GB300, Inkling 2 Mini's
+shapes, context 1100; 2026-11-21, commit 6300f20c) the gather ended ~6.5 us after the
+prologue (whole-K MSGDOWN tiles and 32-row GATEMIX items, two on some CTAs: ~9 us).
 """
 
 import math
@@ -135,7 +136,8 @@ def nanosleep(ns: int, *, loc=None, ip=None):
 def fetch_uniform(segments, out, epoch, backoff: cutlass.Constexpr = 0):
     """``fetch`` polled until every lane of the warp has all its words, so the lanes leave the
     loop together: lanes leaving a divergent poll loop one by one and then waiting at a shuffle
-    for the rest measured a fixed ~17k-cycle stall. Every lane of the warp must call it. With
+    for the rest stalled warps a fixed ~17k cycles on random SMs (GB300, Inkling MLP launch
+    traces; 2026-11-21, commit 9d0c03a7). Every lane of the warp must call it. With
     ``backoff``, a failed poll sleeps about that many nanoseconds: long waits then issue few
     L2 requests while other CTAs' work runs."""
     ready = Int32(0)

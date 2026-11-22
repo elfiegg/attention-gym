@@ -420,7 +420,8 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
         block; at layer 0 the recomputed embedding) and the attention's residual, polled from
         its tagged words. The blocks and embedding load before the wait: warp 0 polls one word
         of each o_proj reducer's row tile, with backoff (a CTA waits here through attention's
-        tail: every thread polling every word measured ~1 us slower attention rows on GB300),
+        tail: every thread polling every word made attention rows ~1 us slower; GB300,
+        2026-11-21, commit 248aaa3f),
         then the CTA fetches the whole residual."""
         per = self.hidden // COMPUTE_THREADS
         num_blocks = p.num_blocks + p.boundary

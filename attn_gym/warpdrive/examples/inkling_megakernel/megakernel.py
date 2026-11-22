@@ -186,9 +186,10 @@ def mlp_lists(op: InklingVisitKernel, ctas: int) -> list[list[list[int]]]:
     every CTA), so a CTA's first down rows, of early slots, wait for nothing; only its last one
     (slot 6 or 7) waits for the last wave. Down rows start where gate/up rows end, so the
     CTAs with one row fewer of each kind are mostly different ones; the router's single-row
-    items go to the least loaded CTAs. On GB300 at Inkling 2 Mini's shapes this measured about
-    1.5 us per launch faster than contiguous runs of rows per CTA (which reuse a down slot's
-    activation fetch but leave every slot's down rows waiting for its last gate/up rows)."""
+    items go to the least loaded CTAs. This measured about 1.5 us per launch faster than
+    contiguous runs of rows per CTA, which reuse a down slot's activation fetch but leave every
+    slot's down rows waiting for its last gate/up rows (CUDA-graph replay of the then separate
+    MLP launch, GB300, Inkling 2 Mini; 2026-11-21, commit 9d0c03a7)."""
     gate_up = [[GATEUP, t, s] for s in range(op.top_k) for t in range(op.gate_tiles)]
     down_rows = [[DOWN, t, s] for s in range(op.top_k) for t in range(op.row_tiles)]
     lists = [[] for _ in range(ctas)]
