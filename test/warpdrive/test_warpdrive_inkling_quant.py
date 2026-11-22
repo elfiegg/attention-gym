@@ -111,6 +111,7 @@ def checkpoint_layers():
     return tensors
 
 
+@pytest.mark.xdist_group("inkling-checkpoint")
 @pytest.mark.parametrize("layer", [0, 19, 20, 23])
 def test_checkpoint_layers(checkpoint_layers, layer):
     """Real layers: equal to ``ref.dequantize_experts``, with w13 in checkpoint row order and,
@@ -126,6 +127,7 @@ def test_checkpoint_layers(checkpoint_layers, layer):
             assert torch.equal(q.dequantize(deinterleave=True), ref_order)
 
 
+@pytest.mark.xdist_group("inkling-checkpoint")
 def test_load_quantized_model_memory():
     """The whole model with experts as stored: ~20 GB of device memory."""
     require_cuda()
