@@ -151,8 +151,7 @@ class InklingChatModel:
         self.cache = InklingCache.empty(self.weights.config, options.max_len)
         self.backend = backend(self.weights, self.cache)
         self.label = f"the {options.backend} backend"
-        effort = options.reasoning_effort or DEFAULT_EFFORT
-        self.effort = effort if effort in EFFORTS else float(effort)
+        self.effort = reasoning_effort(options)
         stops = [
             self.tokenizer.eos_token_id,
             self.tokenizer.convert_tokens_to_ids("<|endoftext|>"),
@@ -191,18 +190,29 @@ def check_options(options: ChatOptions):
         raise typer.BadParameter(f"Inkling backends: {sorted(BACKENDS)}, got {options.backend!r}")
     if options.backend.startswith("megakernel") and options.max_len % 64:
         raise typer.BadParameter("--max-len must be a multiple of 64 (the megakernel's KV block)")
-    qwen_only = {"--engine": options.engine, "--thinking": options.thinking}
-    qwen_only["--yarn-factor"] = options.yarn_factor
+    qwen_only = {
+        "--engine": options.engine,
+        "--thinking": options.thinking,
+        "--yarn-factor": options.yarn_factor,
+    }
     if given := [name for name, value in qwen_only.items() if value is not None]:
         raise typer.BadParameter(f"Qwen-only options given for Inkling: {', '.join(given)}")
-    effort = options.reasoning_effort or DEFAULT_EFFORT
-    if effort not in EFFORTS:
-        try:
-            valid = 0 <= float(effort) <= 0.99
-        except ValueError:
-            valid = False
-        if not valid:
-            raise typer.BadParameter(f"--reasoning-effort: one of {EFFORTS} or 0-0.99")
+    reasoning_effort(options)
+
+
+def reasoning_effort(options: ChatOptions) -> str | float:
+    """The chat template's ``reasoning_effort``: a level name or a number in [0, 0.99]
+    (``DEFAULT_EFFORT`` when not given)."""
+    effort = DEFAULT_EFFORT if options.reasoning_effort is None else options.reasoning_effort
+    if effort in EFFORTS:
+        return effort
+    try:
+        value = float(effort)
+    except ValueError:
+        value = -1.0
+    if not 0 <= value <= 0.99:
+        raise typer.BadParameter(f"--reasoning-effort: one of {EFFORTS} or 0-0.99")
+    return value
 
 
 def load_chat_model(checkpoint: Path, options: ChatOptions) -> InklingChatModel:

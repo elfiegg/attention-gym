@@ -72,6 +72,7 @@ class Compiled:
 
 BACKENDS = {"megakernel": Megakernel, "compile": Compiled}
 DEFAULT_BACKEND = "megakernel"
+DEFAULT_ENGINE = "cuda_core"
 
 
 class QwenChatModel:
@@ -96,15 +97,15 @@ class QwenChatModel:
         shape = (config.num_layers, config.num_kv_heads, max_len, config.head_dim)
         # Zeroed: the compiled step's masked SDPA reads rows past the position (0 * NaN is NaN).
         self.caches = [torch.zeros(shape, device="cuda", dtype=torch.bfloat16) for _ in "kv"]
-        self.backend = BACKENDS[options.backend](
-            self.weights, max_len, self.caches, options.engine or "cuda_core"
-        )
+        engine = options.engine or DEFAULT_ENGINE
+        self.backend = BACKENDS[options.backend](self.weights, max_len, self.caches, engine)
         self.max_len, self.thinking = max_len, bool(options.thinking)
         stops = [self.tokenizer.eos_token_id]
         stops += [self.tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>")]
         self.stops = {s for s in stops if isinstance(s, int) and s >= 0}
-        engine = f"the {options.engine or 'cuda_core'} megakernel"
-        self.label = engine if options.backend == "megakernel" else "torch.compile"
+        self.label = (
+            f"the {engine} megakernel" if options.backend == "megakernel" else "torch.compile"
+        )
         if config.rope_scaling:
             self.label += f", YaRN x{config.rope_scaling.factor:g}"
 

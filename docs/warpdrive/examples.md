@@ -753,6 +753,14 @@ not its cross-CTA critical path; see [raw code and opt-outs](guarantees.md#opt-o
 
 </details>
 
+## Known limits
+
+Both decode variants are OneShot-only. See the [safety contract](guarantees.md) for layer
+mechanisms and analysis boundaries.
+
+For the normal and quick-fuzz commands, see [Tests](index.md#tests). Long campaigns and
+what the harness covers are in the [fuzz harness guide](https://github.com/meta-pytorch/attention-gym/blob/main/test/warpdrive_fuzz/README.md).
+
 ## Inkling 2 Mini decode megakernel
 
 ``inkling_megakernel`` decodes Thinking Machines' Inkling 2 Mini (``thinkingmachines/Inkling-2-Mini``)
@@ -780,17 +788,21 @@ python -m attn_gym.warpdrive.examples.inkling_megakernel.bench --context 1100
   weights exactly, so its outputs equal the bf16-dequantized kernel's bit for bit
   (``--backend megakernel-bf16`` keeps that path). Weights take 19 GB on the device.
 - **Numerics.** Per visit within a few bf16 ulps of the oracle (fp32 summation order and the
-  flash-decoding merge); greedy tokens equal the oracle's over the tested decodes.
+  flash-decoding merge).
 
-GB300, CUDA-graph replay, context 1100 (2026-11-22, branch ``inkling2-mini-megakernel``):
+Decode step at context 1100, GB300, CUDA-graph replay (``bench --context 1100`` at commit
+6939dc8e, 2026-11-22; one run, all rows in the same process):
 
-| Backend | ms per token | tok/s (chat) |
-|---|---:|---:|
-| oracle, eager | ~435 | ~2 |
-| torch step + CUDA graph | 28.7 | 34 |
-| ``torch.compile`` + CUDA graph | ~17-18 | 55 |
-| megakernel, bf16 experts | 3.21 | 307 |
-| megakernel, quantized experts | 3.02 | 328 |
+| Step | ms per token |
+|---|---:|
+| torch step (``fast.decode_step``) | 32.3 |
+| megakernel, bf16 experts | 3.21 |
+| megakernel, quantized experts | 3.03 |
+
+The chat (``--prompt "What is the capital of France? One sentence." --reasoning-effort low
+--max-len 2048``, a 70-token reply, megakernel default backend) decoded at 319 tok/s at commit
+24f4ccc7. Greedy tokens equal the oracle's on the tested checkpoint decodes except where the two
+best logits nearly tie.
 
 The bf16 bandwidth floor is about 1.4 ms per token (about 0.6 ms with quantized experts). The
 step is latency-bound: the serial chain from a visit's attention output to its first expert row
@@ -799,11 +811,3 @@ quantized experts save less than their 3.5x fewer bytes suggest. A visit grid ne
 CTAs resident at once, so visit launches are cooperative: one CTA per SM, admitted only when the
 whole grid fits (otherwise the launch fails, e.g. under MPS or green-context SM limits). Callers
 keep ``0 <= pos < max_len``; positions are read on the device.
-
-## Known limits
-
-Both decode variants are OneShot-only. See the [safety contract](guarantees.md) for layer
-mechanisms and analysis boundaries.
-
-For the normal and quick-fuzz commands, see [Tests](index.md#tests). Long campaigns and
-what the harness covers are in the [fuzz harness guide](https://github.com/meta-pytorch/attention-gym/blob/main/test/warpdrive_fuzz/README.md).
