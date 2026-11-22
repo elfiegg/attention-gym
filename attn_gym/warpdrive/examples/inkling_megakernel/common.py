@@ -328,10 +328,11 @@ class InklingKernel(WarpSpecialized):
         return out
 
     @cute.jit
-    def load_states(self, p, num_blocks, partial, tid):
+    def load_states(self, p, num_blocks, partial, tid, load_partial=True):
         """``(STATES, hidden // COMPUTE_THREADS)`` fp32 registers: the first ``num_blocks``
         completed blocks (zeros past them), then ``partial`` (a ``(hidden,)`` tensor; zeros if
-        None: the caller fills it). Thread t holds elements ``r * 256 + t``."""
+        None or ``load_partial`` is false: the caller fills it). Thread t holds elements
+        ``r * 256 + t``."""
         per = self.hidden // COMPUTE_THREADS
         x = cute.make_rmem_tensor((STATES, per), Float32)
         x.fill(0.0)
@@ -340,8 +341,9 @@ class InklingKernel(WarpSpecialized):
                 for r in cutlass.range_constexpr(per):
                     x[n, r] = Float32(p.blocks[n][r * COMPUTE_THREADS + tid])
         if cutlass.const_expr(partial is not None):
-            for r in cutlass.range_constexpr(per):
-                x[MAX_BLOCKS, r] = Float32(partial[r * COMPUTE_THREADS + tid])
+            if load_partial:
+                for r in cutlass.range_constexpr(per):
+                    x[MAX_BLOCKS, r] = Float32(partial[r * COMPUTE_THREADS + tid])
         return x
 
     @cute.jit

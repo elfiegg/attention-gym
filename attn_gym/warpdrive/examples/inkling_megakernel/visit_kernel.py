@@ -424,7 +424,8 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
         then the CTA fetches the whole residual."""
         per = self.hidden // COMPUTE_THREADS
         num_blocks = p.num_blocks + p.boundary
-        x = self.load_states(p, num_blocks, None, tid)
+        # At layer 0 the only block is h, which CTA 0 may be storing: recomputed, not read.
+        x = self.load_states(p, num_blocks - p.embed_input, None, tid)
         if p.embed_input != 0:
             self.embed_token(p, x, 0, False, tid, warp, lane)
         if warp == 0:

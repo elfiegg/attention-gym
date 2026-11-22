@@ -252,7 +252,8 @@ class AttentionHalf:
     def attention_prologue(self, p, tid, warp, lane):
         """Every CTA: the attention inputs ``xs[0 .. queries)`` from the layer's block
         residuals (layer 0: the token's normalized embedding)."""
-        x = self.load_states(p, p.num_blocks, p.h, tid)
+        # Layer 0 reads no h: CTA 0 may be storing the embedding there.
+        x = self.load_states(p, p.num_blocks, p.h, tid, p.embed_input == 0)
         if p.embed_input != 0:
             self.embed_token(p, x, MAX_BLOCKS, True, tid, warp, lane)
         self.normalize_states(
@@ -305,7 +306,7 @@ class AttentionHalf:
     @cute.jit
     def embed_token(self, p, x, slot: cutlass.Constexpr, store: cutlass.Constexpr, tid, warp,
                     lane):  # fmt: skip
-        """State ``x[slot]`` (``load_states`` read a stale ``h`` there) becomes the token's
+        """State ``x[slot]`` (``load_states`` left it zero) becomes the token's
         embedding row through the weighted RMSNorm (``ref.hidden_states``' first ``h``); with
         ``store``, CTA 0 also stores it to ``h`` for the launches after this one (CTAs of this
         launch recompute it rather than read it)."""
