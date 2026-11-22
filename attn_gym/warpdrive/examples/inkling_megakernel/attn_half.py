@@ -37,7 +37,18 @@ output once.
 
 The load warp streams 32 x 256 weight stages and 64 x 128 KV blocks through the weight ring.
 The cache row at the position is stored only after every item reading the block that holds it
-has finished; those items mask the row's stale contents.
+has finished; those items mask the row's stale contents. That store is a generic write by one
+CTA after other CTAs' TMA (async-proxy) reads of the same block, so the partials double as a
+release/acquire edge:
+
+    ATTN item, newest split   KV stages consumed (mbarrier waits: its TMA reads completed),
+    (the only split reading   barrier, then the thread publishing (m, l): fence.proxy.async
+    the block of ``pos``)     .global, fence.acq_rel.gpu, publish
+    OPROJ row tile 0 item     its merge warps poll every split's (m, l), fence.acq_rel.gpu,
+                              barrier, then every thread stores its cache rows
+
+The ATTN side's proxy fence orders the completed async reads before the generic release; the
+OPROJ side's fence makes the polls an acquire before the barrier that precedes the stores.
 """
 
 import math
@@ -270,6 +281,8 @@ class AttentionHalf:
                 if warp < self.heads_per_split:
                     hq = b * self.heads_per_split + warp
                     self.merge_head(p, hq, warp, obuf, epoch, lane)
+                    if a == 0:  # acquire the partials before ``store_kv_rows`` (module)
+                        cute.arch.fence_acq_rel_gpu()
                 self.csync.sync()
             if a == 0:
                 self.store_kv_rows(p, b, pos, epoch, tid)
@@ -662,6 +675,9 @@ class AttentionHalf:
         item = hq * self.splits + split
         publish(p.attn_o, item * HEAD_DIM + d, num, epoch)
         if d == 0:
+            if newest:  # release this item's TMA reads of the block of pos (module docstring)
+                cute.arch.fence_proxy("async.global")
+                cute.arch.fence_acq_rel_gpu()
             publish(p.attn_ml, 2 * item, mx, epoch)
             publish(p.attn_ml, 2 * item + 1, den, epoch)
 
@@ -681,7 +697,8 @@ class AttentionHalf:
         """Cache rows ``pos`` of the kv heads whose q heads o_proj split ``split`` covers, from
         their writers' published K/V, by row tile 0's item of the split after its merge: every
         ATTN item of those heads has then published its partial, after its last KV load, so no
-        TMA read of the block holding ``pos`` is in flight."""
+        TMA read of the block holding ``pos`` is in flight (the release/acquire edge of the
+        module docstring orders those reads before these stores)."""
         heads = self.heads_per_split // self.group
         max_len = p.k_cache.shape[0] // self.kv_heads
         for i in cutlass.range_constexpr(-(-heads * HEAD_DIM // COMPUTE_THREADS)):
