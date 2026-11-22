@@ -706,14 +706,15 @@ class AttentionHalf:
         their writers' published K/V, by row tile 0's item of the split after its merge: every
         ATTN item of those heads has then published its partial, after its last KV load, so no
         TMA read of the block holding ``pos`` is in flight (the release/acquire edge of the
-        module docstring orders those reads before these stores). A position outside
-        ``[0, max_len)`` (a caller's error) stores nothing rather than another head's row."""
+        module docstring orders those reads before these stores). ``0 <= pos < max_len`` is
+        the caller's contract; a position at or past ``max_len`` stores nothing rather than
+        another head's (or the next visit's) row. A negative one is not guarded: it writes
+        before the visit's rows here and in the convolution rings (``pos % RING`` truncates)."""
         heads = self.heads_per_split // self.group
         max_len = p.k_cache.shape[0] // self.kv_heads
-        in_range = (pos >= 0) & (pos < max_len)
         for i in cutlass.range_constexpr(-(-heads * HEAD_DIM // COMPUTE_THREADS)):
             index = i * COMPUTE_THREADS + tid
-            if (index < heads * HEAD_DIM) & in_range:
+            if (index < heads * HEAD_DIM) & (pos < max_len):
                 kvh = split * heads + index // HEAD_DIM
                 d = index % HEAD_DIM
                 vals = cute.make_rmem_tensor((2,), Float32)

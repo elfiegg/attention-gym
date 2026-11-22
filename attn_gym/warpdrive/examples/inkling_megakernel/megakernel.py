@@ -420,8 +420,9 @@ class InklingVisitMegakernel:
         holds the post-attention residual.
 
         The position must satisfy ``0 <= pos < cache.max_len``: the caller owns it and the
-        launch reads it on the device, so it is not checked here (the cache-row store skips an
-        out-of-range position rather than write past the visit's rows)."""
+        launch reads it on the device, so it is not checked here. Only ``pos >= max_len`` is
+        guarded (the cache-row store skips it rather than write past the visit's rows); a
+        negative position writes before the visit's cache rows and convolution rings."""
         config, hidden = self.config, self.config.hidden_size
         if cache.max_len % BLOCK:
             raise ValueError(f"the cache capacity must be a multiple of {BLOCK}")
