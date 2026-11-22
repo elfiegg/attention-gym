@@ -14,8 +14,8 @@ Per lane, row and 256-column subtile (columns ``8l .. 8l + 7``):
 - NVFP4: one re-encoded 32-bit word and the 16-byte ``lut[expert, scale]`` byte planes;
   ``nvfp4_bf16x8`` selects each column's low and high magnitude byte with ``prmt`` (the
   code's magnitude is the selector nibble), ORs the sign into the high byte and interleaves
-  the bytes into 4 bf16x2 words: 12 ALU-pipe instructions and 2 FMA-pipe shifts per 8
-  weights. The planes of the routed experts are staged in SMEM (global gathers through L1
+  the bytes into 4 bf16x2 words: 12 ALU-pipe instructions (PRMT, LOP3) per 8 weights,
+  plus 2 shifts that ptxas emits as IMAD.HI/IMAD.SHL on the FMA pipe. The planes of the routed experts are staged in SMEM (global gathers through L1
   cost 4.4 us of 19 per expert set).
 - MXFP8: two words of e4m3 bytes; ``mxfp8_bf16x8`` converts each byte pair exactly
   (``cvt.rn.bf16x2.e4m3x2``) and multiplies by the bf16 power of two ``2 ** (s - 127)``
@@ -89,12 +89,11 @@ MAX_STAGES = 16
 LANE_WORDS = {BF16: 4, quant.NVFP4: 1, quant.MXFP8: 2}  # weight words per lane, row, subtile
 SUBTILE_WORDS = {f: 32 * w for f, w in LANE_WORDS.items()}
 # Tile-major scale words per subtile: 8 warps x blocks (each word: a block's 4 warp rows).
-BLOCKS = {quant.NVFP4: TILE_K // 16, quant.MXFP8: TILE_K // 32}
+BLOCKS = {fmt: TILE_K // columns for fmt, columns in quant.BLOCK_COLUMNS.items()}
 GATEUP, DOWN = range(2)
 TENSOR_ARGS = ("experts", "x", "act", "lut13", "lut2", "out")
 
 assert (ROWS, TILE_K, COMPUTE_WARPS) == (quant.TILE_ROWS, quant.SUBTILE, quant.WARPS)
-assert TILE_K // 32 == quant.LANE_COLUMNS
 assert COMPUTE_THREADS == 256  # stage_inputs: one 16-byte plane entry per thread and slot
 
 
@@ -126,8 +125,8 @@ def nvfp4_bf16x8(word, planes, *, loc=None, ip=None) -> list:
     """The 8 bf16 weights of one re-encoded NVFP4 word (``quant``'s layout) as 4 bf16x2 words
     (columns 2j, 2j + 1 in word j, the even column low), given the scale's magnitude byte
     planes ``lut[expert, scale]`` (4 words: low bytes of codes 0-3, 4-7, high bytes of 0-3,
-    4-7). PRMT reads selector nibbles from the low 16 bits; a nibble's top bit (a sign here)
-    would select sign replication, hence the masks."""
+    4-7); the code's sign flips the value's. PRMT reads selector nibbles from the low 16 bits;
+    a nibble's top bit (a sign here) would select sign replication, hence the masks."""
     out = inline_asm(
         [T.i32()] * 4,
         [Int32(word), *(Int32(p) for p in planes)],
@@ -140,15 +139,15 @@ def nvfp4_bf16x8(word, planes, *, loc=None, ip=None) -> list:
         "prmt.b32 ha, $7, $8, sa;\n"
         "prmt.b32 lb, $5, $6, sb;\n"
         "prmt.b32 hb, $7, $8, sb;\n"
-        "lop3.b32 ha, ha, $4, 0x80808080, 0xF8;\n"  # | signs of columns 0-3 (bits 8k + 7)
+        "lop3.b32 ha, ha, $4, 0x80808080, 0x78;\n"  # ^ signs of columns 0-3 (bits 8k + 7)
         "shl.b32 t, $4, 4;\n"
-        "lop3.b32 hb, hb, t, 0x80808080, 0xF8;\n"  # | columns 4-7 (bits 8(k - 4) + 3)
+        "lop3.b32 hb, hb, t, 0x80808080, 0x78;\n"  # ^ columns 4-7 (bits 8(k - 4) + 3)
         "prmt.b32 $0, la, ha, 0x5140;\n"
         "prmt.b32 $1, la, ha, 0x7362;\n"
         "prmt.b32 $2, lb, hb, 0x5140;\n"
         "prmt.b32 $3, lb, hb, 0x7362;\n"
         "}",
-        "=r,=r,=r,=r,r,r,r,r,r",
+        "=&r,=&r,=&r,=&r,r,r,r,r,r",  # early clobber: outputs are written in turn
         loc,
         ip,
     )
@@ -178,7 +177,7 @@ def mxfp8_bf16x8(word0, word1, scale, *, loc=None, ip=None) -> list:
         "cvt.rn.bf16x2.e4m3x2 v, d;\n"
         "mul.rn.bf16x2 $3, v, $6;\n"
         "}",
-        "=r,=r,=r,=r,r,r,r",
+        "=&r,=&r,=&r,=&r,r,r,r",  # early clobber: $0 is written before $6 is last read
         loc,
         ip,
     )
@@ -198,7 +197,7 @@ def fma_bf16x2(acc0, acc1, w, x, *, loc=None, ip=None):
         "fma.rn.f32.bf16 $0, w0, x0, $2;\n"
         "fma.rn.f32.bf16 $1, w1, x1, $3;\n"
         "}",
-        "=f,=f,f,f,r,r",
+        "=&f,=&f,f,f,r,r",  # early clobber: $0 is written before $3 is read
         loc,
         ip,
     )
@@ -286,12 +285,10 @@ class QuantGemvKernel(WarpSpecialized):
     ):
         if fmt not in FORMATS:
             raise ValueError(f"format must be one of {FORMATS}, got {fmt!r}")
-        if 2 * width != hidden or hidden % TILE_K or width % 8:
-            raise ValueError("need 2 * width == hidden, a multiple of 256, and width % 8 == 0")
-        if stage_subtiles is None:
+        if 2 * width != hidden or hidden % TILE_K:
+            raise ValueError("need 2 * width == hidden, a multiple of 256")
+        if stage_subtiles is None:  # bf16: the fused kernel's 16 KB stage
             stage_subtiles = 1 if fmt == BF16 else 4
-        if fmt == BF16 and stage_subtiles != 1:
-            raise ValueError("bf16 stages are one subtile (a TMA box is at most 256 elements)")
         if not 1 <= stage_subtiles * SUBTILE_WORDS[fmt] <= 256:
             raise ValueError(f"stage_subtiles {stage_subtiles} exceeds a 256-word TMA box")
         self.fmt, self.hidden, self.width = fmt, hidden, width
@@ -579,6 +576,11 @@ class QuantGemv:
         fmt = BF16 if dense else w13.format
         experts, h = w13.shape[:2] if dense else (w13.experts, w13.rows)
         width = w2.shape[2] if dense else w2.columns
+        shapes = [tuple(w.shape) if dense else (w.experts, w.rows, w.columns) for w in (w13, w2)]
+        if dense != isinstance(w2, torch.Tensor) or (not dense and w2.format != fmt):
+            raise ValueError("w13 and w2 must have the same format")
+        if shapes != [(experts, h, h), (experts, h, width)]:
+            raise ValueError(f"expected w13 (E, H, H) and w2 (E, H, I), got {shapes}")
         self.op = QuantGemvKernel(fmt, h, width, experts, top_k, **options)
         self.workspace, self.max_ctas = self.op.work.launch_args(torch.device(device))
         # Unused arguments of a format (bf16 scales, MXFP8 planes) get 4-word placeholders.

@@ -40,8 +40,8 @@ def require_sm100():
         pytest.skip("the GEMV requires an SM100-family GPU")
 
 
-def random_checkpoint(fmt: str, rows: int, columns: int, seed: int, experts: int = EXPERTS):
-    return random_checkpoint_experts(fmt, experts, rows, columns, seed)
+def random_checkpoint(fmt, rows, columns, seed, mx_scales=(10, 254), experts=EXPERTS):
+    return random_checkpoint_experts(fmt, experts, rows, columns, seed, mx_scales)
 
 
 # ------------------------------------------------------------------ loader layout
@@ -50,8 +50,9 @@ def random_checkpoint(fmt: str, rows: int, columns: int, seed: int, experts: int
 @pytest.mark.parametrize("fmt", [NVFP4, MXFP8])
 @pytest.mark.parametrize("columns", [HIDDEN, WIDTH])
 def test_layout_round_trip(fmt, columns):
-    """Every code, scale and the 4.5-subtile row: the kernel layout decodes to the oracle's
-    bf16 weights bit for bit (signed zeros included)."""
+    """Every non-NaN code and scale byte (NVFP4 negative and subnormal scales, MXFP8 scales up
+    to overflow) and the 4.5-subtile row: the kernel layout decodes to the oracle's bf16
+    weights bit for bit (signed zeros and infinities included)."""
     require_cuda()
     tensors = random_checkpoint(fmt, 64, columns, seed=columns, experts=4)
     q = QuantExperts.from_checkpoint(*tensors)
@@ -180,51 +181,67 @@ def routed_inputs():
     return experts, x, act
 
 
-@pytest.mark.parametrize("fmt", [NVFP4, MXFP8])
-def test_quant_gemv_bitwise(fmt, routed_inputs):
-    """8 routed experts' gate/up (K 2304) and down (K 1152, 4.5 subtiles) tiles: the quantized
-    kernel equals the bf16 kernel on the dequantized weights and the torch emulation bitwise,
-    across stage shapes; a CUDA graph replay and a new routing reuse one compile."""
+def quant_gemv_module():
     require_sm100()
     pytest.importorskip("cutlass.cute")
-    # Imported here: the layout tests above need no CuTeDSL.
-    from attn_gym.warpdrive.examples.inkling_megakernel.quant_gemv import (
-        QuantGemv,
-        compile_quant_gemv,
-    )
+    # Imported here: the layout tests need no CuTeDSL.
+    from attn_gym.warpdrive.examples.inkling_megakernel import quant_gemv
 
-    experts, x, act = routed_inputs
-    w13 = QuantExperts.from_checkpoint(*random_checkpoint(fmt, 2 * WIDTH, HIDDEN, seed=11))
-    w2 = QuantExperts.from_checkpoint(*random_checkpoint(fmt, HIDDEN, WIDTH, seed=12))
-    d13, d2 = w13.dequantize(), w2.dequantize()
-    expected = torch.stack(
+    return quant_gemv
+
+
+def expected_gemv(d13, d2, experts, x, act) -> torch.Tensor:
+    """``reference_gemv`` of every slot: (gate/up | down, slot, row)."""
+    slots = list(enumerate(experts.tolist()))
+    return torch.stack(
         [
-            torch.stack([reference_gemv(d13[e], x) for e in experts.tolist()]),
-            torch.stack([reference_gemv(d2[e], act[s]) for s, e in enumerate(experts.tolist())]),
+            torch.stack([reference_gemv(d13[e], x) for _, e in slots]),
+            torch.stack([reference_gemv(d2[e], act[s]) for s, e in slots]),
         ]
     )
-    dense = QuantGemv(d13, d2).run(experts, x, act).clone()
-    assert torch.equal(dense, expected)
-    for stage_subtiles in (1, 2, 3):
-        runner = QuantGemv(w13, w2, stage_subtiles=stage_subtiles)
-        out = runner.run(experts, x, act).clone()
+
+
+@pytest.mark.parametrize("fmt", [NVFP4, MXFP8])
+def test_quant_gemv_bitwise(fmt, routed_inputs):
+    """8 routed experts' gate/up (K 2304) and down (K 1152, 4.5 subtiles) tiles over every
+    code and (NVFP4) every scale byte: the quantized kernel equals the bf16 kernel on the
+    dequantized weights and the torch emulation bitwise, for every stage shape; a CUDA graph
+    replay and a new routing (and runner) reuse one compile."""
+    qg = quant_gemv_module()
+    experts, x, act = routed_inputs
+    mx = (100, 130)  # finite products: an inf would make the dot products NaN
+    w13 = QuantExperts.from_checkpoint(*random_checkpoint(fmt, 2 * WIDTH, HIDDEN, 11, mx))
+    w2 = QuantExperts.from_checkpoint(*random_checkpoint(fmt, HIDDEN, WIDTH, 12, mx))
+    d13, d2 = w13.dequantize(), w2.dequantize()
+    expected = expected_gemv(d13, d2, experts, x, act)
+    assert torch.equal(qg.QuantGemv(d13, d2).run(experts, x, act), expected)
+    for stage_subtiles in (None, 1, 2, 3):  # None: the default, 4
+        runner = qg.QuantGemv(w13, w2, stage_subtiles=stage_subtiles)
+        out = runner.run(experts, x, act)
         assert torch.equal(out, expected), (stage_subtiles, (out - expected).abs().max())
 
-    compile_fn = compile_quant_gemv
     runner.out.zero_()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         runner.run(experts, x, act)
     graph.replay()
     assert torch.equal(runner.out, expected)
-    misses = compile_fn.cache_info().misses
-    other = experts.flip(0).contiguous()  # a different slot order: still one compile
-    out = runner.run(other, x, act)
-    reordered = torch.stack(
-        [
-            torch.stack([reference_gemv(d13[e], x) for e in other.tolist()]),
-            torch.stack([reference_gemv(d2[e], act[s]) for s, e in enumerate(other.tolist())]),
-        ]
-    )
-    assert torch.equal(out, reordered)
-    assert compile_fn.cache_info().misses == misses
+    info = qg.compile_quant_gemv.cache_info()
+    other = experts.flip(0).contiguous()  # another slot order, through a new runner
+    out = qg.QuantGemv(w13, w2, stage_subtiles=3).run(other, x, act)
+    assert torch.equal(out, expected_gemv(d13, d2, other, x, act))
+    after = qg.compile_quant_gemv.cache_info()
+    assert (after.currsize, after.misses) == (info.currsize, info.misses)
+
+
+@pytest.mark.parametrize("layer", [0, 20])
+def test_quant_gemv_checkpoint(checkpoint_layers, routed_inputs, layer):
+    """Real NVFP4 (layer 0) and MXFP8 (layer 20) experts: bit-identical to the bf16 kernel on
+    the oracle's dequantized weights."""
+    qg = quant_gemv_module()
+    experts, x, act = routed_inputs
+    weights = [checkpoint_layers(layer, name) for name in ("w13_weight", "w2_weight")]
+    w13, w2 = (QuantExperts.from_checkpoint(*tensors) for tensors in weights)
+    dense = qg.QuantGemv(*(ref.dequantize_experts(*tensors) for tensors in weights))
+    expected = dense.run(experts, x, act).clone()
+    assert torch.equal(qg.QuantGemv(w13, w2).run(experts, x, act), expected)

@@ -15,10 +15,11 @@ The layout follows the GEMV: 32-row x 256-column subtiles, warp w of 8 owning ro
   columns ``k = 0..7``) is re-encoded for the kernel's byte-permute decode: nibble k holds the
   3-bit magnitude of column k in bits 4k .. 4k + 2, and the sign of column k sits at bit
   8k + 7 for k < 4 and 8(k - 4) + 3 for k >= 4 (the nibbles' top bits). ``lut[e, s]`` holds
-  the bf16 magnitudes ``bf16((e2m1[i] * s) * amax_e / denominator)`` of the 8 codes i for fp8
-  scale byte s as byte planes: four int32 words, the low bytes of codes 0-3, of 4-7, then the
-  high bytes of codes 0-3, of 4-7. The table evaluates ``ref.dequantize_experts``' fp32
-  operations, so the decode is exact for every scale. The per-expert factor stays fp32
+  the bf16 values ``bf16((e2m1[i] * s) * amax_e / denominator)`` of the 8 non-negative codes
+  i for fp8 scale byte s as byte planes: four int32 words, the low bytes of codes 0-3, of
+  4-7, then the high bytes of codes 0-3, of 4-7; the code's sign flips the value's sign bit.
+  The table evaluates ``ref.dequantize_experts``' fp32 operations and negation is exact, so
+  the decode is exact for every scale byte and factor. The per-expert factor stays fp32
   (amax / denominator) as in the oracle; HF's loader rounds amax to bf16 first.
 - MXFP8 weights are the checkpoint's e4m3 bytes; the kernel converts them to bf16 and
   multiplies by the bf16 power of two ``2 ** (s - 127)`` of the scale byte s. That is the
@@ -39,18 +40,18 @@ from attn_gym.warpdrive.examples.inkling_megakernel import ref
 
 NVFP4, MXFP8 = "nvfp4", "mxfp8"
 # The GEMV's geometry (quant_gemv checks it against the engine's).
-TILE_ROWS, SUBTILE, WARPS, LANE_COLUMNS = 32, 256, 8, 8
+TILE_ROWS, SUBTILE, WARPS = 32, 256, 8
 WARP_ROWS = TILE_ROWS // WARPS
 BLOCK_COLUMNS = {NVFP4: 16, MXFP8: 32}
 MIN_MX_SCALE = 10  # smallest MXFP8 scale byte whose products with e4m3 values are normal
 CHUNK = 8  # experts per conversion step: bounds the int64 temporaries
 
 
-def e2m1_magnitude_table(scale: torch.Tensor, factor: torch.Tensor) -> torch.Tensor:
-    """bf16 ``(experts, 256, 8)`` magnitudes of the 8 positive E2M1 codes for every fp8 scale
+def e2m1_value_table(factor: torch.Tensor) -> torch.Tensor:
+    """bf16 ``(experts, 256, 8)`` values of the 8 non-negative E2M1 codes for every fp8 scale
     byte: ``ref.dequantize_experts``' ``(e2m1 * scale) * factor`` in fp32, rounded once."""
-    e2m1 = torch.tensor(ref.E2M1_VALUES[:8], device=scale.device)
-    scales = torch.arange(256, device=scale.device, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    e2m1 = torch.tensor(ref.E2M1_VALUES[:8], device=factor.device)
+    scales = torch.arange(256, device=factor.device, dtype=torch.uint8).view(torch.float8_e4m3fn)
     products = e2m1 * scales.float()[:, None]  # (256, 8), exact
     return (products * factor[:, None, None]).to(torch.bfloat16)
 
@@ -156,6 +157,8 @@ class QuantExperts:
         """The kernel layout of checkpoint tensors as ``ref.dequantize_experts`` takes them:
         NVFP4 when ``amax`` is given, else MXFP8."""
         experts, rows = weight.shape[:2]
+        if scale is None:
+            raise ValueError("unquantized experts: dequantize them with ref.dequantize_experts")
         if rows % TILE_ROWS:
             raise ValueError(f"rows must be a multiple of {TILE_ROWS}, got {rows}")
         if amax is None:
@@ -164,13 +167,15 @@ class QuantExperts:
                     f"MXFP8 scale bytes below {MIN_MX_SCALE} give subnormal products, which the "
                     "kernel's bf16 multiply does not reproduce"
                 )
-            return cls(MXFP8, weight.shape[2], weight.view(torch.uint8), tile_scales(scale, 32))
+            scales = tile_scales(scale, BLOCK_COLUMNS[MXFP8])
+            return cls(MXFP8, weight.shape[2], weight.view(torch.uint8), scales)
         factor = amax.float() / denominator.float()
         encoded = torch.empty_like(weight, dtype=torch.uint8)
         for start in range(0, experts, CHUNK):
             encoded[start : start + CHUNK] = encode_nvfp4(weight[start : start + CHUNK])
-        lut = magnitude_planes(e2m1_magnitude_table(scale, factor))
-        return cls(NVFP4, 2 * weight.shape[2], encoded, tile_scales(scale, 16), lut)
+        lut = magnitude_planes(e2m1_value_table(factor))
+        scales = tile_scales(scale, BLOCK_COLUMNS[NVFP4])
+        return cls(NVFP4, 2 * weight.shape[2], encoded, scales, lut)
 
     def dequantize(self, deinterleave: bool = False) -> torch.Tensor:
         """bf16 ``(experts, rows, columns)`` weights decoded from the kernel layout, equal to
@@ -191,13 +196,13 @@ class QuantExperts:
                 continue
             codes = decode_nvfp4(self.weight[chunk])  # (e, rows, columns)
             magnitude = (codes & 7).unflatten(-1, (-1, block))
-            # The kernel's lookup: byte planes of lut[e, s], low byte then high byte | sign.
+            # The kernel's lookup: byte planes of lut[e, s], low byte then high byte ^ sign.
             planes = self.lut[chunk].long() & 0xFFFFFFFF  # (e, 256, 4)
             plane_bytes = (planes[..., None] >> (8 * torch.arange(4, device=planes.device))) & 0xFF
             lo_hi = plane_bytes.view(*planes.shape[:2], 2, 8)  # (e, 256, lo|hi, code)
             e = torch.arange(magnitude.shape[0], device=planes.device)[:, None, None, None]
             lo = lo_hi[e, s[..., None], 0, magnitude]
-            hi = lo_hi[e, s[..., None], 1, magnitude] | (
+            hi = lo_hi[e, s[..., None], 1, magnitude] ^ (
                 (codes >> 3).unflatten(-1, (-1, block)) << 7
             )
             bits = (hi << 8 | lo).flatten(-2)
@@ -210,26 +215,34 @@ class QuantExperts:
 
 
 def random_checkpoint_experts(
-    fmt: str, experts: int, rows: int, columns: int, seed: int, device="cuda"
+    fmt: str,
+    experts: int,
+    rows: int,
+    columns: int,
+    seed: int,
+    mx_scales: tuple[int, int] = (MIN_MX_SCALE, 254),
+    device="cuda",
 ) -> tuple:
     """Random checkpoint-format expert tensors ``(weight, scale, amax, denominator)`` as
-    ``ref.dequantize_experts`` takes them, covering every code: NVFP4 with fp8 scales over
-    every positive finite e4m3 byte from 0x08 (2**-6) and amax in [0.1, 0.6); MXFP8 without
-    NaN codes and with scale bytes 100 .. 130 (the checkpoint's are 113 .. 118)."""
+    ``ref.dequantize_experts`` takes them, over every non-NaN code: NVFP4 with every non-NaN
+    fp8 scale byte (negative and subnormal ones included) and amax in [0.1, 0.6); MXFP8 with
+    scale bytes in ``mx_scales`` (inclusive; large ones overflow to inf; the checkpoint's are
+    113 .. 118)."""
     gen = torch.Generator(device=device).manual_seed(seed)
 
     def random_bytes(*shape, low=0, high=256):
         return torch.randint(low, high, shape, generator=gen, device=device, dtype=torch.uint8)
 
     if fmt == NVFP4:
-        scale = random_bytes(experts, rows, columns // 16, low=0x08, high=0x7F)
+        scale = random_bytes(experts, rows, columns // 16)
+        scale[(scale & 0x7F) == 0x7F] = 0x38  # e4m3 NaN -> 1.0
         amax = torch.rand(experts, generator=gen, device=device) * 0.5 + 0.1
         weight = random_bytes(experts, rows, columns // 2)
         denominator = torch.tensor([2688.0], device=device)
         return weight, scale.view(torch.float8_e4m3fn), amax, denominator
     weight = random_bytes(experts, rows, columns)
     weight[(weight & 0x7F) == 0x7F] = 0x3C  # e4m3 NaN codes -> 1.5
-    scale = random_bytes(experts, rows, columns // 32, low=100, high=131)
+    scale = random_bytes(experts, rows, columns // 32, low=mx_scales[0], high=mx_scales[1] + 1)
     return weight.view(torch.float8_e4m3fn), scale, None, None
 
 
@@ -239,9 +252,4 @@ def load_quantized_inkling_weights(
     """``ref.load_inkling_weights`` with every layer's ``w13``/``w2`` a ``QuantExperts`` in
     checkpoint row order (bf16 checkpoint experts, if any, are rejected)."""
 
-    def experts(weight, scale, amax, denominator, gate_up):
-        if scale is None:
-            raise ValueError("this loader expects quantized experts")
-        return QuantExperts.from_checkpoint(weight, scale, amax, denominator)
-
-    return ref.load_inkling_weights(path_or_repo, device, experts=experts)
+    return ref.load_inkling_weights(path_or_repo, device, experts=QuantExperts.from_checkpoint)
