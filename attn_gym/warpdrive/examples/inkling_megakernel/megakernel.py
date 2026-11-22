@@ -101,8 +101,6 @@ def visit_kernel_for(
     full: bool,
     messages: bool = False,
     experts_format: str = BF16,
-    splits: int | None = None,
-    stages: int | None = None,
 ) -> InklingVisitKernel:
     """The visit kernel for ``config``'s full (``full``) or sliding layers, with message gates
     (``messages``) or without, streaming experts in ``experts_format``."""
@@ -121,7 +119,7 @@ def visit_kernel_for(
         rms_eps=config.rms_eps,
         qk_clip=config.qk_clip,
         rel_clip=config.rel_clip,
-        splits=splits or (FULL_SPLITS if full else SLIDING_SPLITS),
+        splits=FULL_SPLITS if full else SLIDING_SPLITS,
         full=full,
         width=config.moe_intermediate_size,
         experts=config.num_experts,
@@ -134,7 +132,6 @@ def visit_kernel_for(
         log_floor=config.log_scaling_floor if full else 0,
         messages=messages,
         experts_format=experts_format,
-        stages=stages,
     )
 
 
@@ -279,16 +276,13 @@ class MessageGates:
 
 
 class Launch:
-    """One kernel's launch state: instruction table, tagged scratch, epoch and the trace
-    buffer (a placeholder unless a ``trace_session`` swaps in its own). Launches sharing it
-    must run one at a time in stream order."""
+    """One kernel's launch state: instruction table, tagged scratch, epoch and the visit
+    kernel's trace buffer argument (a placeholder: the runners compile without tracing).
+    Launches sharing it must run one at a time in stream order."""
 
-    def __init__(self, op, build, device, trace: str | None = None):
+    def __init__(self, op, build, device):
         self.workspace, self.max_ctas = op.work.launch_args(torch.device(device))
         self.table = build(op, self.max_ctas).to(device)
-        if trace is not None:  # a work item, its regions and ring waits per row of a CTA
-            events = 32 * -(-self.table.shape[0] // self.max_ctas) + 64
-            op = op.with_settings(trace_backend=trace, trace_events_per_role=events)
         self.op = op
         self.scratch = torch.zeros(op.scratch_size, device=device, dtype=torch.int64)
         self.state = torch.zeros(2, device=device, dtype=torch.int32)
@@ -320,11 +314,13 @@ class VisitLayer:
     router: torch.Tensor  # (experts, hidden) bf16 (``bf16_router``)
     experts_format: str  # ``experts_format``
     experts: tuple[torch.Tensor, ...]  # ``expert_args``
+    full: bool  # a full-attention layer (it has q/k/v norms), else a sliding one
 
     @classmethod
     def of(cls, config: InklingConfig, w: LayerWeights) -> "VisitLayer":
         query = w.attn_query
-        if w.q_norm is not None:  # a full layer
+        full = w.q_norm is not None
+        if full:
             norms = gated_norms = torch.stack((w.q_norm, w.k_norm, w.v_norm))
             k_dynamic, v_dynamic = w.k_dynamic, w.v_dynamic
             k_taps, v_taps = w.k_static, w.v_static
@@ -346,6 +342,7 @@ class VisitLayer:
             router=bf16_router(w.router),
             experts_format=experts_format(w),
             experts=expert_args(w),
+            full=full,
         )
 
 
@@ -361,30 +358,18 @@ class InklingVisitMegakernel:
     """Launch state of the visit kernels for ``config`` (per layer kind: sliding or full,
     without or with message gates, and each experts format of ``layers``) and the kernel-form
     arguments of ``layers``. Launches of one runner must run one at a time in stream order
-    (each kind's launches share a scratch and an epoch). ``splits``: KV splits per q head of
-    (sliding, full) layers. ``trace``: compile with ranges for the work items and
-    ``trace_region``s, recorded by ``"globaltimer"`` (into
-    ``launches[full, messages, experts_format].trace_buffer``) or ``"iket"``."""
+    (each kind's launches share a scratch and an epoch). Each launch is cooperative: it
+    occupies every SM until it finishes and fails (CUDA error 720) where its one-CTA-per-SM
+    grid cannot be resident at once (see the module docstring)."""
 
-    def __init__(
-        self,
-        config: InklingConfig,
-        layers: tuple[LayerWeights, ...],
-        splits: tuple[int | None, int | None] = (None, None),
-        stages: int | None = None,
-        device="cuda",
-        trace: str | None = None,
-    ):
+    def __init__(self, config: InklingConfig, layers: tuple[LayerWeights, ...], device="cuda"):
         self.config = config
         self.args = {id(w): VisitLayer.of(config, w) for w in layers}
         self.layers = layers  # keeps the ids of ``args`` valid
         formats = sorted({args.experts_format for args in self.args.values()})
         self.launches = {
             (full, messages, fmt): Launch(
-                visit_kernel_for(config, full, messages, fmt, splits[full], stages),
-                build_visit_table,
-                device,
-                trace,
+                visit_kernel_for(config, full, messages, fmt), build_visit_table, device
             )
             for full in (False, True)
             for messages in (False, True)
@@ -400,9 +385,15 @@ class InklingVisitMegakernel:
         )
 
     def launch_of(self, w: LayerWeights, layer: int, messages: bool) -> Launch:
-        """The launch state of layer ``layer`` (weights ``w``), with message gates or
-        without."""
-        return self.launches[self.config.is_full(layer), messages, self.args[id(w)].experts_format]
+        """The launch state of layer ``layer`` (weights ``w``, one of the runner's layers), with
+        message gates or without."""
+        args = self.args.get(id(w))
+        if args is None:
+            raise ValueError("w must be one of the layers this runner was built with")
+        if args.full != self.config.is_full(layer):
+            kind = "full" if args.full else "sliding"
+            raise ValueError(f"layer {layer}'s weights are a {kind} layer's, unlike config's")
+        return self.launches[args.full, messages, args.experts_format]
 
     def __call__(
         self,
@@ -433,9 +424,8 @@ class InklingVisitMegakernel:
         config, hidden = self.config, self.config.hidden_size
         if cache.max_len % BLOCK:
             raise ValueError(f"the cache capacity must be a multiple of {BLOCK}")
-        args = self.args.get(id(w))
-        if args is None:
-            raise ValueError("w must be one of the layers this runner was built with")
+        launch = self.launch_of(w, layer, gates is not None)
+        args = self.args[id(w)]
         if embed is not None and (w.attn_query is not None or blocks):
             raise ValueError("only layer 0 (no query, no blocks) reads the embedding")
         if gates is not None and w.attn_query is None:
@@ -448,7 +438,6 @@ class InklingVisitMegakernel:
         states += [h] * (MAX_BLOCKS - len(states))  # unread
         if out is None:
             out = torch.empty(hidden, device=h.device, dtype=torch.bfloat16)
-        launch = self.launch_of(w, layer, gates is not None)
         self.last = launch
         table, norm, token = embed or self.no_embed
         compile_visit_kernel(launch.op)(
@@ -510,7 +499,8 @@ class InklingVisitMegakernel:
     def routed_experts(self, w: LayerWeights) -> torch.Tensor:
         """The ``(experts_per_token,)`` experts the last launch (which must be of layer weights
         ``w``) routed to, ascending: the top-k of its published router logits' scores plus ``w``'s
-        correction bias, recomputed here."""
+        correction bias, recomputed here with the kernel's tie rule (equal keys go to the lower
+        expert index; ``torch.topk`` does not promise an order among ties)."""
         keys = torch.sigmoid(tagged_values(self.last, "logits")) + w.router_bias
         order = torch.sort(keys, descending=True, stable=True).indices
         return order[: self.last.op.top_k].sort().values
@@ -558,14 +548,13 @@ class InklingHeadMegakernel:
     """Launch state of the head kernel (final block residual, norm, LM head, softcap) for
     ``weights``."""
 
-    def __init__(self, weights: InklingWeights, stages: int | None = None, device="cuda"):
+    def __init__(self, weights: InklingWeights, device="cuda"):
         config = weights.config
         op = InklingHeadKernel.get_or_build(
             hidden=config.hidden_size,
             vocab=config.vocab_size,
             rms_eps=config.rms_eps,
             softcap=config.logit_softcap,
-            stages=stages,
         )
 
         def build(op, ctas):
