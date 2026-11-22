@@ -6,7 +6,9 @@ Inkling 2 Mini stores the experts of layers 0-19 as NVFP4 and of layers 20-23 as
 quantized, in the checkpoint's row order: ``w13`` rows interleave gate and up (row 2j is gate
 row j, 2j + 1 up row j), so a 32-row tile holds 16 (gate, up) pairs, as the MLP kernel's
 strided view of the bf16 weights does. ``load_quantized_inkling_weights`` loads the model with
-such experts: 19.0 GB of device memory, 15.7 GB of it experts (bf16 experts: 48.9 GB).
+such experts: 19.0 GB of device memory, 15.7 GB of it experts (bf16 experts: 48.9 GB). The
+oracle's dense code paths reject them; ``forward_tokens`` runs the oracle on such a model by
+dequantizing only each MLP's routed experts, and ``dequantized_weights`` returns the bf16 model.
 
 The layout follows the GEMV: 32-row x 256-column subtiles, warp w of 8 owning rows
 4w .. 4w + 3 and lane l columns 8l .. 8l + 7 of every subtile.
@@ -31,6 +33,7 @@ The layout follows the GEMV: 32-row x 256-column subtiles, warp w of 8 owning ro
   subtile (the down projection's 1152 columns are 4.5 subtiles) has zero scales past the end.
 """
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -177,6 +180,13 @@ class QuantExperts:
         scales = tile_scales(scale, BLOCK_COLUMNS[NVFP4])
         return cls(NVFP4, 2 * weight.shape[2], encoded, scales, lut)
 
+    def select(self, experts: torch.Tensor) -> "QuantExperts":
+        """The experts ``experts`` (indices), in that order."""
+        lut = None if self.lut is None else self.lut[experts]
+        return QuantExperts(
+            self.format, self.columns, self.weight[experts], self.scale[experts], lut
+        )
+
     def dequantize(self, deinterleave: bool = False) -> torch.Tensor:
         """bf16 ``(experts, rows, columns)`` weights decoded from the kernel layout, equal to
         ``ref.dequantize_experts`` of the checkpoint tensors. Checkpoint row order, or with
@@ -253,3 +263,44 @@ def load_quantized_inkling_weights(
     checkpoint row order (bf16 checkpoint experts, if any, are rejected)."""
 
     return ref.load_inkling_weights(path_or_repo, device, experts=QuantExperts.from_checkpoint)
+
+
+def dense_layer(w: ref.LayerWeights, experts: torch.Tensor | None = None) -> ref.LayerWeights:
+    """``w`` with bf16 experts in ``ref.load_inkling_weights``' layout: its ``QuantExperts``
+    dequantized (only ``experts``, in that order, if given), dense ones as they are."""
+    if isinstance(w.w13, torch.Tensor):
+        return w
+    w13, w2 = (w.w13, w.w2) if experts is None else (w.w13.select(experts), w.w2.select(experts))
+    return dataclasses.replace(w, w13=w13.dequantize(deinterleave=True), w2=w2.dequantize())
+
+
+def dequantized_weights(weights: ref.InklingWeights) -> ref.InklingWeights:
+    """``weights`` with every layer's experts in bf16 (``dense_layer``)."""
+    return dataclasses.replace(weights, layers=tuple(dense_layer(w) for w in weights.layers))
+
+
+def experts_out(config: ref.InklingConfig, w: ref.LayerWeights, x, experts, weights):
+    """``ref.experts_out`` on a layer whose experts may be ``QuantExperts``: the routed experts
+    dequantized (ascending, so the sum keeps the oracle's order) give the same result."""
+    if isinstance(w.w13, torch.Tensor):
+        return ref.experts_out(config, w, x, experts, weights)
+    used = experts.unique()
+    local = torch.searchsorted(used, experts)
+    return ref.experts_out(config, dense_layer(w, used), x, local, weights)
+
+
+QUANTIZED = ref.Kernels(experts=experts_out)
+
+
+@torch.no_grad()
+def forward_tokens(
+    weights: ref.InklingWeights, tokens: torch.Tensor, pos: int, cache: ref.InklingCache
+) -> torch.Tensor:
+    """``ref.forward_tokens`` (the last token's fp32 logits) on a model whose experts may be
+    ``QuantExperts`` (``experts_out``), with the oracle's results."""
+    tokens = tokens.reshape(-1)
+    if pos + tokens.numel() > cache.max_len:
+        raise ValueError(f"positions up to {pos + tokens.numel()} exceed max_len {cache.max_len}")
+    positions = torch.arange(pos, pos + tokens.numel(), device=tokens.device)
+    h = ref.hidden_states(weights, tokens, positions, cache, start=pos, kernels=QUANTIZED)
+    return ref.logits_of(weights, h[-1:]).squeeze(0)

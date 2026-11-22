@@ -2,7 +2,8 @@
 ``ref.dequantize_experts`` exactly, and the quantized expert GEMV (``quant_gemv``) returns
 bit-identical dot products to the same GEMV on the bf16-dequantized weights and to a torch
 emulation of its fp32 accumulation order, for NVFP4 and MXFP8, in a CUDA graph and with one
-compile across routings."""
+compile across routings; the oracle's MoE runs on a quantized layer (``quant.experts_out``)
+with the dense results."""
 
 import gc
 
@@ -10,7 +11,7 @@ import pytest
 import torch
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
-from attn_gym.warpdrive.examples.inkling_megakernel import ref
+from attn_gym.warpdrive.examples.inkling_megakernel import quant, ref
 from attn_gym.warpdrive.examples.inkling_megakernel.quant import (
     MXFP8,
     NVFP4,
@@ -130,6 +131,37 @@ def test_load_quantized_model_memory(checkpoint_layers):
     assert formats == [NVFP4] * 20 + [MXFP8] * 4
     assert all(isinstance(layer.w2, QuantExperts) for layer in weights.layers)
     assert 15 < gigabytes < 24, gigabytes
+
+
+# ------------------------------------------------------------------ oracle on quantized
+
+
+def test_experts_out_on_quantized_layer():
+    """``quant.experts_out`` (the oracle's MoE on a quantized layer, as the chat's prefill runs
+    it) equals ``ref.experts_out`` on the dequantized layer bit for bit."""
+    require_cuda()
+    hidden, width, experts, tokens = 256, 128, 16, 5
+    q13, q2 = (
+        QuantExperts.from_checkpoint(
+            *random_checkpoint(NVFP4, rows, columns, seed, experts=experts)
+        )
+        for rows, columns, seed in ((2 * width, hidden, 1), (hidden, width, 2))
+    )
+    fields = dict.fromkeys(ref.LayerWeights.__dataclass_fields__, None)
+    w = ref.LayerWeights(**fields | {"w13": q13, "w2": q2})
+    dense = ref.LayerWeights(
+        **fields | {"w13": q13.dequantize(deinterleave=True), "w2": q2.dequantize()}
+    )
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    x = torch.randn(tokens, hidden, device="cuda", generator=gen).bfloat16()
+    routed = torch.stack(
+        [torch.randperm(experts, device="cuda", generator=gen)[:4] for _ in range(tokens)]
+    )
+    route_weights = torch.rand(tokens, 4, device="cuda", generator=gen)
+    config = ref.InklingConfig()
+    expected = ref.experts_out(config, dense, x, routed, route_weights)
+    out = quant.experts_out(config, w, x, routed, route_weights)
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
 
 
 # ------------------------------------------------------------------ GEMV
