@@ -425,7 +425,11 @@ class InklingVisitMegakernel:
         input). With ``embed`` (layer 0 only), the launch computes ``h`` itself,
         ``ref.hidden_states``' normalized embedding of the token, and stores it into ``h``.
         Returns the bf16 ``(hidden,)`` visit output (into ``out`` if given); ``residual()``
-        holds the post-attention residual."""
+        holds the post-attention residual.
+
+        The position must satisfy ``0 <= pos < cache.max_len``: the caller owns it and the
+        launch reads it on the device, so it is not checked here (the cache-row store skips an
+        out-of-range position rather than write past the visit's rows)."""
         config, hidden = self.config, self.config.hidden_size
         if cache.max_len % BLOCK:
             raise ValueError(f"the cache capacity must be a multiple of {BLOCK}")
@@ -629,7 +633,8 @@ class InklingDecoder:
     ) -> torch.Tensor:
         """One decode step of the one-element int64 ``token`` at the one-element device
         position ``pos`` (int32 avoids a cast); writes the caches there and returns fp32 logits
-        ``(vocab,)`` (a buffer the next step overwrites). Syncs nothing."""
+        ``(vocab,)`` (a buffer the next step overwrites). Syncs nothing, so ``pos`` is not
+        checked: the caller keeps ``0 <= pos < cache.max_len``."""
         config, weights = self.config, self.weights
         positions = device_position(pos)
         embed = EmbedArgs(weights.embed, weights.embed_norm, token.reshape(1))

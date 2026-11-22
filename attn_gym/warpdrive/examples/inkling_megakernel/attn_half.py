@@ -159,13 +159,13 @@ class AttentionHalf:
             raise ValueError(f"q heads must be a multiple of kv heads and of {O_SPLITS}")
         if q_heads // O_SPLITS > COMPUTE_WARPS or (q_heads // O_SPLITS * HEAD_DIM) % TILE_K:
             raise ValueError("an o_proj split merges one head per warp in whole 256-column tiles")
-        if (q_heads // O_SPLITS) % (q_heads // kv_heads):
-            raise ValueError("an o_proj split must cover whole groups of q heads")
         if q_heads // O_SPLITS * HEAD_DIM > hidden:
             raise ValueError(
                 f"an o_proj split's {q_heads // O_SPLITS} heads x {HEAD_DIM} merge into one "
                 f"hidden-size ({hidden}) input row: need q_heads <= {O_SPLITS * hidden // HEAD_DIM}"
             )
+        if (q_heads // O_SPLITS) % (q_heads // kv_heads):
+            raise ValueError("an o_proj split must cover whole groups of q heads")
         if d_rel % 8 or d_rel > 32 or not 0 < extent <= min(rel_width, hidden):
             raise ValueError("need d_rel a multiple of 8 up to 32 and extent <= rel_width, hidden")
         if full and conv_kernel % 2:
@@ -706,12 +706,14 @@ class AttentionHalf:
         their writers' published K/V, by row tile 0's item of the split after its merge: every
         ATTN item of those heads has then published its partial, after its last KV load, so no
         TMA read of the block holding ``pos`` is in flight (the release/acquire edge of the
-        module docstring orders those reads before these stores)."""
+        module docstring orders those reads before these stores). A position outside
+        ``[0, max_len)`` (a caller's error) stores nothing rather than another head's row."""
         heads = self.heads_per_split // self.group
         max_len = p.k_cache.shape[0] // self.kv_heads
+        in_range = (pos >= 0) & (pos < max_len)
         for i in cutlass.range_constexpr(-(-heads * HEAD_DIM // COMPUTE_THREADS)):
             index = i * COMPUTE_THREADS + tid
-            if index < heads * HEAD_DIM:
+            if (index < heads * HEAD_DIM) & in_range:
                 kvh = split * heads + index // HEAD_DIM
                 d = index % HEAD_DIM
                 vals = cute.make_rmem_tensor((2,), Float32)
