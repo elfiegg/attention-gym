@@ -13,10 +13,9 @@ of each message gate's down projection that reads it (``ref.message_gate``'s ``h
          gate   32 rows of the gate's down projection x its second half on bf16 rms(m)
                                                                -> fp32 message halves
 
-The attention and MLP launches of the pass read ``messages`` and ``mhalf`` (``common``'s
-GATEMIX). Items depend on nothing but the prologue: no tagged words, no epoch. Roles as
-``mlp_kernel``: warp 8 ``load`` streams 32 x 256 weight stages, warps 0-7 ``compute`` run
-``CudaCoreGemv``.
+The visit launches of the pass read ``messages`` and ``mhalf`` (``common``'s GATEMIX). Items
+depend on nothing but the prologue: no tagged words, no epoch. Roles as ``visit_kernel``:
+warp 8 ``load`` streams 32 x 256 weight stages, warps 0-7 ``compute`` run ``CudaCoreGemv``.
 """
 
 from dataclasses import dataclass

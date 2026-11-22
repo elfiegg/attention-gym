@@ -10,8 +10,8 @@ position with the inputs a real megakernel step produced there, rewriting the sa
 and activations may stay in L2). A launch graph replays ``reps`` calls of one launch of the
 step back to back and reports the time per call; the breakdown multiplies each kind's time by
 its launches per step, and the rest of the measured step is the gaps between launches, plus
-whatever a repeated launch gains over its first run inside a step (an attention layer's ~54 MB
-of weights may stay partly in L2 across repeats despite evict-first loads). Graphs
+whatever a repeated launch gains over its first run inside a step (a layer's ~54 MB of
+attention weights may stay partly in L2 across repeats despite evict-first loads). Graphs
 are timed in ``rounds`` interleaved rounds (rotating order) and each row reports the median of
 the round medians. Default DVFS.
 """
@@ -97,8 +97,7 @@ def launch_kinds(config: ref.InklingConfig) -> dict[str, tuple[str, int, int]]:
     for visit, layer, p in config.visits():
         layer_kind = "full" if config.is_full(layer) else "sliding"
         messages = " + messages" if config.is_loop(layer) and p > 0 else ""
-        add(f"attention{messages}, {layer_kind}", "attn", visit)
-        add(f"MLP{messages}", "mlp", visit)
+        add(f"visit{messages}, {layer_kind}", "visit", visit)
     for p in range(1, config.num_passes):
         add("messages", "msg", p - 1)
     add("head", "head", 0)
@@ -123,7 +122,7 @@ def main(
     token = ref.forward_tokens(weights, prompt, 0, cache).argmax().reshape(1)
     pos = torch.tensor([context], device="cuda", dtype=torch.int32)
     decoder = InklingDecoder(weights)
-    calls = {name: [] for name in ("attn", "mlp", "msg", "head")}
+    calls = {name: [] for name in ("visit", "msg", "head")}
     for name, recorded in calls.items():
         setattr(decoder, name, Recorder(getattr(decoder, name), recorded))
     decoder(token, pos, cache)

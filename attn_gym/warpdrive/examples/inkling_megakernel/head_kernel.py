@@ -10,7 +10,7 @@ Batch one, one token. The launch implements ``ref.hidden_states``' last block re
 
 The LM head's rows need no padding: TMA zero-fills the last tile's rows past the vocabulary,
 whose logits are not stored. Items depend on nothing but the prologue: no tagged words, no
-epoch. Roles as ``mlp_kernel``: warp 8 ``load`` streams 32 x 256 weight stages, warps 0-7
+epoch. Roles as ``visit_kernel``: warp 8 ``load`` streams 32 x 256 weight stages, warps 0-7
 ``compute`` run ``CudaCoreGemv``.
 """
 
@@ -132,8 +132,8 @@ class InklingHeadKernel(InklingKernel):
     @cute.jit
     def compute(self, p: HeadParams, *, w: Consumer, work: WorkCursor, me: Local):
         tid, warp, lane = me.tid, me.warp, me.lane
-        x = self.load_states(p, p.h, tid)
-        self.normalize_states(p, x, p.query, 1, Int32(1), tid, warp, lane)
+        x = self.load_states(p, p.num_blocks, p.h, tid)
+        self.normalize_states(p, x, p.num_blocks, p.query, p.norms, 1, Int32(1), tid, warp, lane)
         cap = self.softcap
         while work.valid:
             _op, tile, _b, _row = work.item

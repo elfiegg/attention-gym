@@ -1,8 +1,8 @@
-"""The attention half of one Inkling 2 Mini decode visit as one persistent warpdrive launch
-(``InklingAttnKernel``) and its compile function; ``megakernel`` holds the host side.
+"""The attention half of an Inkling 2 Mini decode visit: the device code of the visit
+launch's attention rows (``AttentionHalf``, a mixin of ``visit_kernel.InklingVisitKernel``).
 
-Batch one, one token. The launch implements ``ref.attention_block`` with ``start=None``
-(device position, the whole cache behind its mask)::
+Batch one, one token. The rows implement ``ref.attention_block`` with ``start=None`` (device
+position, the whole cache behind its mask)::
 
     every CTA   prologue: block residual over [blocks..., h] for each of the layer's queries
                 (none at layer 0; there ``embed`` makes h the token's normalized embedding
@@ -23,68 +23,35 @@ Batch one, one token. The launch implements ``ref.attention_block`` with ``start
                 gate, then 32 o_proj rows x 768 columns;
                 the last quarter's item reduces its 32
                 columns: split-order sum, post-attention
-                conv (ring write), residual               -> fp32 residual
-                (row tile 0's items also store the new
+                conv (ring write), residual               -> fp32 residual (tagged: the
+                (row tile 0's items also store the new       MLP half's input)
                 K/V rows once their heads' items finished)
 
 Sliding layers read the keys in ``(pos - window, pos]`` with static k/v convolutions; full
 layers read ``[0, pos]`` with dynamic taps and log scaling of the query and relative state.
-Full layers and layers with messages project q, k and v from three input streams. ``full``
-and ``messages`` are constructor choices: one compile per layer kind. Scores are rounded to bf16 as
-the oracle's (``bf16(bf16(bf16(q.k) * scale) + bf16(rel . rel_proj[:, distance]))``); the
-softmax runs in the log2 domain over flash partials, so probabilities are not rounded to bf16
-before the value sum as in the oracle: the merge rounds the normalized output once.
+Full layers and layers with messages project q, k and v from three input streams. Scores are
+rounded to bf16 as the oracle's (``bf16(bf16(bf16(q.k) * scale) + bf16(rel . rel_proj[:,
+distance]))``); the softmax runs in the log2 domain over flash partials, so probabilities are
+not rounded to bf16 before the value sum as in the oracle: the merge rounds the normalized
+output once.
 
-Roles, tagged words, the weight ring and the epoch follow ``mlp_kernel`` (and
-``qwen_megakernel``): warp 8 ``load`` streams 32 x 256 weight stages and 64 x 128 KV blocks
-through one ring, warps 0-7 ``compute`` consume them. The host deals rows round-robin in
-dependency order (QKV, ATTN, OPROJ by split) for ``StaticPersistent``; with every CTA resident
-the earliest unfinished row has its producers finished. The cache row at the position is
-stored only after every item reading the block that holds it has finished; those items mask
-the row's stale contents.
+The load warp streams 32 x 256 weight stages and 64 x 128 KV blocks through the weight ring.
+The cache row at the position is stored only after every item reading the block that holds it
+has finished; those items mask the row's stale contents.
 """
 
 import math
-from dataclasses import dataclass
 
 import cutlass
-from cuda.bindings import driver as cuda
-from cutlass import BFloat16, Float32, Int32, Int64, cute
+from cutlass import BFloat16, Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync
 
-from attn_gym.warpdrive import (
-    Consumer,
-    Local,
-    NamedBarrier,
-    Producer,
-    Ring,
-    SmemPlan,
-    StageView,
-    StaticPersistent,
-    Tma,
-    Warps,
-    WorkCursor,
-    WorkStream,
-    role,
-)
-from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     MAX_BLOCKS,
-    MIX_FLOATS,
-    MSGDOWN,
-    RED_VALUES,
-    REDUCTIONS,
     RING,
-    SMEM_BYTES,
-    SMEM_HEADROOM,
-    WORDS,
-    GateParams,
-    InklingKernel,
-    fake_gate_args,
     fetch_uniform,
     fp32,
     fp32_reciprocal,
-    gate_atoms,
     load_tiles,
 )
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
@@ -93,12 +60,8 @@ from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     COMPUTE_WARPS,
     HEAD_DIM,
     LOG2E,
-    MAX_STAGES,
     ROWS,
-    STAGE_BYTES,
     TILE_K,
-    CudaCoreGemv,
-    InstructionTable,
     bf16_round,
     fetch,
     group_sum,
@@ -111,59 +74,7 @@ QKV, ATTN, OPROJ = range(3)
 # attention reads first, the output gate and sink (read by OPROJ) last.
 Q, K, V, REL, KDYN, VDYN, GATE, SINK = range(8)
 O_SPLITS = 4  # o_proj split-K: a quarter of the q heads each
-QKVS_FLOATS = 512  # an attention item's head vectors (see ``InklingAttnKernel.qkvs_words``)
-# AttnParams fields passed to the kernel as one tuple of argument tensors, in this order.
-TENSOR_ARGS = (
-    "trace_buffer", "state", "pos", "token", "embed", "embed_norm", "h", "query", "norms",
-    "q_scale", "rel_scale", "rel_proj", "k_taps", "v_taps", "attn_conv", "ring_k", "ring_v",
-    "ring_attn", "k_cache", "v_cache", "mhalf", "messages", "out",
-)  # fmt: skip
-
-
-@dataclass(frozen=True)
-class AttnParams:
-    tma: tuple  # TMA atoms: projection matrices (Q .. SINK, kernel's order), wo, k and v cache
-    gmem: tuple  # their tile partitions: (TMA, row tiles, k tiles)
-    sW: StageView  # weight stage partition
-    sKV: StageView  # KV stage partition
-    xs: cute.Tensor  # (STREAMS + 2, hidden) bf16: attention inputs, then two o_proj inputs
-    red: cute.Tensor  # (REDUCTIONS, COMPUTE_WARPS, RED_VALUES) fp32 prologue reductions
-    mix: cute.Tensor  # (MIX_FLOATS,) fp32 the prologue's block-residual weights (messages)
-    qkvs: cute.Tensor  # (QKVS_FLOATS,) fp32 an attention item's head vectors
-    att: cute.Tensor  # (COMPUTE_WARPS + 1, HEAD_DIM + 2) fp32 per-warp flash states
-    proj: cute.Tensor  # tagged int64 projections (``proj_offsets``)
-    attn_o: cute.Tensor  # tagged int64 (q_heads, splits, HEAD_DIM) unnormalized O
-    attn_ml: cute.Tensor  # tagged int64 (q_heads, splits, 2) (m in log2 units, l)
-    o_part: cute.Tensor  # tagged int64 (O_SPLITS, hidden) o_proj partials
-    kv_new: cute.Tensor  # tagged int64 (2, kv_dim): the new K, then V row of every kv head
-    gate: GateParams | None  # message gates (``messages`` kernels)
-    state: cute.Tensor  # int32 (2,): launch epoch, finished CTAs
-    pos: cute.Tensor  # int32 (1,) position of the token
-    token: cute.Tensor  # int64 (1,) the token (read when ``embed``)
-    embed: cute.Tensor  # (vocab rows, hidden) bf16 embedding table
-    embed_norm: cute.Tensor  # (hidden,) bf16
-    h: cute.Tensor  # (hidden,) bf16 visit input; written by CTA 0 when ``embed``
-    blocks: tuple  # MAX_BLOCKS (hidden,) bf16 completed blocks; the first num_blocks are read
-    num_blocks: Int32
-    queries: Int32  # 0: the input is h itself (layer 0), 1: block residuals
-    boundary: Int32  # 1: the residual restarts from the attention output
-    embed_input: Int32  # 1: h is the token's normalized embedding row (layer 0)
-    query: cute.Tensor  # (streams, hidden) fp32 block-residual queries
-    norms: cute.Tensor  # (streams, hidden) bf16 input RMSNorm weights
-    q_scale: cute.Tensor  # (q_heads, HEAD_DIM) bf16
-    rel_scale: cute.Tensor  # (q_heads, d_rel) bf16
-    rel_proj: cute.Tensor  # (rel_width, d_rel) bf16: ref's rel_proj transposed, a row per distance
-    k_taps: cute.Tensor  # sliding: (kv_dim, kernel) fp32; full: (kernel, kv_dim) bf16 static
-    v_taps: cute.Tensor
-    attn_conv: cute.Tensor  # (hidden, kernel) fp32 post-attention taps
-    ring_k: cute.Tensor  # (RING, kv_dim) bf16 the visit's k/v/attention convolution inputs
-    ring_v: cute.Tensor
-    ring_attn: cute.Tensor  # (RING, hidden) bf16
-    k_cache: cute.Tensor  # (kv_heads * max_len, HEAD_DIM) bf16 the visit's keys
-    v_cache: cute.Tensor
-    mhalf: cute.Tensor  # (GATES * GATE_RANK,) fp32 message halves (read when ``messages``)
-    messages: cute.Tensor  # (GATES, hidden) fp32
-    out: cute.Tensor  # (hidden,) fp32 post-attention residual
+QKVS_FLOATS = 512  # an attention item's head vectors (see ``AttentionHalf.qkvs_words``)
 
 
 @cute.jit
@@ -199,37 +110,38 @@ def clip_factor(ss, threshold: cutlass.Constexpr):
     return cutlass.min(scale, Float32(1.0))
 
 
-class InklingAttnKernel(InklingKernel):
-    """One visit's attention half (see the module docstring). Constructor arguments are the
-    model sizes and constants the kernel reads. ``full``: a full-attention layer (three
-    block-residual queries, dynamic k/v taps, log scaling ``log_alpha``/``log_floor``), else a
-    sliding one (``window`` keys). ``messages``: a core visit after the first pass, whose q, k
-    and v inputs pass through message gates. ``extent``: distances with a relative bias;
-    ``rel_width``: columns of ``rel_proj``. ``splits``: KV splits per q head (static; pick for
-    the window or the contexts decoded). ``stages``: ring depth in 16 KB stages."""
+class AttentionHalf:
+    """The attention rows of a visit launch (see the module docstring). Its params carry, besides
+    ``InklingKernel``'s: ``tma_attn``/``gmem_attn`` (the projection matrices in ``matrices``
+    order, then wo), ``tma_kv``/``gmem_kv`` (k and v cache), ``sW``/``sKV`` stage views,
+    ``qkvs`` (QKVS_FLOATS fp32), ``att`` (``(COMPUTE_WARPS + 1, HEAD_DIM + 2)`` fp32), the
+    tagged ``proj``, ``attn_o``, ``attn_ml``, ``o_part``, ``kv_new`` and ``resid`` and the
+    argument tensors of ``visit_kernel.VisitParams``."""
 
-    def __init__(
+    def init_attention(
         self,
-        hidden: int,
         q_heads: int,
         kv_heads: int,
         d_rel: int,
         rel_width: int,
         extent: int,
-        conv_kernel: int,
-        rms_eps: float,
         qk_clip: float,
         rel_clip: float,
         splits: int,
         full: bool,
-        window: int = 0,
-        log_alpha: float = 0.0,
-        log_floor: int = 0,
-        messages: bool = False,
-        stages: int | None = None,
+        window: int,
+        log_alpha: float,
+        log_floor: int,
     ):
-        if hidden % COMPUTE_THREADS or hidden % TILE_K or hidden % ROWS:
-            raise ValueError(f"hidden size must be a multiple of {COMPUTE_THREADS}")
+        """Model sizes and constants of the attention rows (``self.hidden``, ``conv_kernel``
+        and ``messages`` set before). ``full``: a full-attention layer (three block-residual
+        queries, dynamic k/v taps, log scaling ``log_alpha``/``log_floor``), else a sliding
+        one (``window`` keys). ``extent``: distances with a relative bias; ``rel_width``:
+        columns of ``rel_proj``. ``splits``: KV splits per q head (static; pick for the window
+        or the contexts decoded)."""
+        hidden, conv_kernel = self.hidden, self.conv_kernel
+        if hidden % ROWS:
+            raise ValueError(f"hidden size must be a multiple of {ROWS}")
         if q_heads % kv_heads or q_heads % O_SPLITS:
             raise ValueError(f"q heads must be a multiple of kv heads and of {O_SPLITS}")
         if q_heads // O_SPLITS > COMPUTE_WARPS or (q_heads // O_SPLITS * HEAD_DIM) % TILE_K:
@@ -244,19 +156,16 @@ class InklingAttnKernel(InklingKernel):
             raise ValueError("need a kernel-2..RING convolution and 1 to 32 splits")
         if full != (window == 0) or full != (log_floor > 0):
             raise ValueError("full layers take log scaling and no window; sliding the reverse")
-        self.hidden, self.q_heads, self.kv_heads = hidden, q_heads, kv_heads
+        self.q_heads, self.kv_heads = q_heads, kv_heads
         self.group = q_heads // kv_heads
         self.d_rel, self.rel_width, self.extent = d_rel, rel_width, extent
-        self.conv_kernel, self.rms_eps = conv_kernel, rms_eps
         self.qk_clip, self.rel_clip = qk_clip, rel_clip
         self.splits, self.full, self.window = splits, full, window
         self.log_alpha, self.log_floor = log_alpha, log_floor
-        self.init_messages(messages, 0, (0, 1, 2) if full else (0, 0, 0))
         self.queries = 3 if full else 1  # block-residual queries of the prologue
-        self.streams = 3 if full or messages else 1  # q, k, v input streams
+        self.streams = 3 if full or self.messages else 1  # q, k, v input streams
         self.kv_dim = kv_heads * HEAD_DIM
         self.heads_per_split = q_heads // O_SPLITS
-        self.hidden_k_tiles = hidden // TILE_K
         self.oproj_k_tiles = self.heads_per_split * HEAD_DIM // TILE_K
         self.row_tiles = hidden // ROWS
         if self.qkvs_words > QKVS_FLOATS:
@@ -273,31 +182,6 @@ class InklingAttnKernel(InklingKernel):
             offsets[m] = offset
             offset += self.proj_tiles[m] * ROWS
         self.proj_offsets, self.proj_size = offsets, offset
-        fixed = (
-            2 * (self.streams + 2) * hidden
-            + 4 * (REDUCTIONS * COMPUTE_WARPS * RED_VALUES + MIX_FLOATS + QKVS_FLOATS)
-            + 4 * (COMPUTE_WARPS + 1) * (HEAD_DIM + 2)
-            + SMEM_HEADROOM
-        )
-        fit = (SMEM_BYTES - fixed) // STAGE_BYTES
-        stages = min(MAX_STAGES, fit) if stages is None else stages
-        if not 2 <= stages <= fit:
-            raise ValueError(f"stages must be in [2, {fit}], got {stages}")
-        self.stages = stages
-        self.smem_plan = SmemPlan()
-        w = self.smem_plan.buffer("W", BFloat16, align=1024)
-        kv = self.smem_plan.buffer("KV", BFloat16, align=1024, overlaps=w)
-        self.smem_plan.buffer("X", BFloat16, align=16)
-        self.smem_plan.buffer("RED", Float32, align=16)
-        self.smem_plan.buffer("MIX", Float32, align=16)
-        self.smem_plan.buffer("QKVS", Float32, align=16)
-        self.smem_plan.buffer("ATT", Float32, align=16)
-        # Compute reads stages with generic loads before TMA refills them; the layer emits the
-        # fence.proxy.async on a Warps release of a Tma-filled ring.
-        self.w = Ring(stages, Tma(STAGE_BYTES), Warps, buffer={"W": w, "KV": kv})
-        self.csync = NamedBarrier(threads=COMPUTE_THREADS)
-        self.engine = CudaCoreGemv()
-        self.work = WorkStream(mapping=InstructionTable(words=WORDS), schedule=StaticPersistent())
 
     @property
     def qkvs_words(self) -> int:
@@ -305,140 +189,125 @@ class InklingAttnKernel(InklingKernel):
         state (d_rel), then in full layers the dynamic k and v taps (kernel each)."""
         return 3 * HEAD_DIM + self.d_rel + (2 * self.conv_kernel if self.full else 0)
 
-    @property
-    def scratch_shapes(self) -> dict[str, int]:
-        """Tagged int64 words of each per-launch intermediate."""
-        shapes = {
+    def attention_scratch_shapes(self) -> dict[str, int]:
+        """Tagged int64 words of each attention intermediate; ``resid`` is the half's output."""
+        return {
             "proj": self.proj_size,
             "attn_o": self.q_heads * self.splits * HEAD_DIM,
             "attn_ml": self.q_heads * self.splits * 2,
             "o_part": O_SPLITS * self.hidden,
             "kv_new": 2 * self.kv_dim,
+            "resid": self.hidden,
         }
-        return shapes | self.gate_scratch_shapes()
 
-    def partial(self, p: AttnParams):
-        return p.h
+    def attention_rows(self) -> list[list[int]]:
+        """Table rows ``[op, a, b]`` of the attention in dependency order: QKV tiles
+        (attention's projections first, the gate and sink last), ATTN items split-major, then
+        OPROJ rows split-major (the last split's rows reduce their tiles)."""
+        rows = [[QKV, t, m] for m in self.matrices for t in range(self.proj_tiles[m])]
+        rows += [[ATTN, hq, s] for s in range(self.splits) for hq in range(self.q_heads)]
+        return rows + [[OPROJ, t, s] for s in range(O_SPLITS) for t in range(self.row_tiles)]
 
-    def get_name(self) -> str:
-        kind = ("full" if self.full else f"swa{self.window}") + ("_msg" if self.messages else "")
-        return (
-            f"warpdrive_inkling_attn_{kind}_h{self.hidden}_q{self.q_heads}kv{self.kv_heads}"
-            f"_kv{self.splits}_s{self.stages}{self.trace_key()}"
-        )
+    # ------------------------------------------------------------------ rows
 
-    # ------------------------------------------------------------------ roles
-
-    @role(warps=COMPUTE_WARPS)
     @cute.jit
-    def load(self, p: AttnParams, *, w: Producer, work: WorkCursor):
-        w = w.views(W=p.sW, KV=p.sKV)
+    def load_attention(self, p, w, op, a, b, pos):
+        """The load warp's stages of attention row ``(op, a, b)``."""
         count = len(self.matrices)
-        tma_o, tma_k, tma_v = p.tma[count], p.tma[count + 1], p.tma[count + 2]
-        g_o, g_k, g_v = p.gmem[count], p.gmem[count + 1], p.gmem[count + 2]
-        pos = Int32(p.pos[0])
-        max_len = p.k_cache.shape[0] // self.kv_heads
-        while work.valid:
-            op, a, b, _row = work.item
-            if op == QKV:
-                for i in cutlass.range_constexpr(count):
-                    if b == self.matrices[i]:
-                        w = load_tiles(w, p.tma[i], p.gmem[i], a, 0, self.hidden_k_tiles, "W")
-            elif op == ATTN:
-                blk0, blk1, _newest = self.split_blocks(pos, b)
-                row0 = (a // self.group) * (max_len // BLOCK)
-                for blk in cutlass.range(blk0, blk1, unroll=1):
-                    w = load_tiles(w, tma_k, g_k, row0 + blk, 0, 1, "KV")
-                    w = load_tiles(w, tma_v, g_v, row0 + blk, 0, 1, "KV")
-            elif op == OPROJ:
-                k_tiles = self.oproj_k_tiles
-                w = load_tiles(w, tma_o, g_o, a, b * k_tiles, k_tiles, "W")
-            if cutlass.const_expr(self.messages):
-                if op >= MSGDOWN:
-                    w = self.load_gate_item(p, w, op, a, b)
-            work.advance()
-        return w, work
+        if op == QKV:
+            for i in cutlass.range_constexpr(count):
+                if b == self.matrices[i]:
+                    w = load_tiles(
+                        w, p.tma_attn[i], p.gmem_attn[i], a, 0, self.hidden_k_tiles, "W"
+                    )
+        elif op == ATTN:
+            max_len = p.k_cache.shape[0] // self.kv_heads
+            blk0, blk1, _newest = self.split_blocks(pos, b)
+            row0 = (a // self.group) * (max_len // BLOCK)
+            for blk in cutlass.range(blk0, blk1, unroll=1):
+                w = load_tiles(w, p.tma_kv[0], p.gmem_kv[0], row0 + blk, 0, 1, "KV")
+                w = load_tiles(w, p.tma_kv[1], p.gmem_kv[1], row0 + blk, 0, 1, "KV")
+        else:
+            k_tiles = self.oproj_k_tiles
+            w = load_tiles(w, p.tma_attn[count], p.gmem_attn[count], a, b * k_tiles, k_tiles, "W")
+        return w
 
-    @role(warps=range(COMPUTE_WARPS))
     @cute.jit
-    def compute(self, p: AttnParams, *, w: Consumer, work: WorkCursor, me: Local):
-        tid, warp, lane = me.tid, me.warp, me.lane
-        epoch = p.state[0] + 1
-        pos = Int32(p.pos[0])
-        with self.trace_region("normalize"):
-            x = self.load_states(p, p.h, tid)
-            if p.embed_input != 0:
-                self.embed_token(p, x, tid, warp, lane)
-            self.normalize_states(p, x, p.query, self.queries, p.queries, tid, warp, lane)
-        obuf = Int32(self.streams)
-        gathered = Int32(0)
-        while work.valid:
-            op, a, b, item = work.item
-            if cutlass.const_expr(self.messages):
-                w, gathered = self.message_item(
-                    p, w, op, a, b, gathered, epoch, tid, warp, lane, item
-                )
-            if op == QKV:
-                vals, row, chans = self.engine.tile(
-                    p, (w,), (), self.stream_of(b), self.hidden_k_tiles, warp, lane
-                )
-                w = chans[0]
-                if self.engine.owns_row(warp, lane):
-                    index = self.proj_offset(b) + a * ROWS + row
-                    publish(p.proj, index, bf16_round(vals[0]), epoch)
-            elif op == ATTN:
-                blk0, blk1, newest = self.split_blocks(pos, b)
-                if (blk0 == blk1) & (b != newest):
-                    self.publish_empty_partial(p, a, b, epoch, tid)
-                else:
-                    w = self.attention(p, w, a, b, pos, epoch, tid, warp, lane, item)
-            elif op == OPROJ:
-                # Alternate o_proj input buffers: every warp passed the last merge's barrier
-                # after finishing the row before it, the last reader of this buffer.
-                obuf = 2 * self.streams + 1 - obuf
-                with self.trace_region("merge", payload=item):
-                    if warp < self.heads_per_split:
-                        hq = b * self.heads_per_split + warp
-                        self.merge_head(p, hq, warp, obuf, epoch, lane)
-                    self.csync.sync()
-                if a == 0:
-                    self.store_kv_rows(p, b, pos, epoch, tid)
-                vals, row, chans = self.engine.tile(
-                    p, (w,), (), obuf, self.oproj_k_tiles, warp, lane
-                )
-                w = chans[0]
-                if self.engine.owns_row(warp, lane):
-                    publish(p.o_part, b * self.hidden + a * ROWS + row, vals[0], epoch)
-                if (b == O_SPLITS - 1) & (warp == 0):
-                    with self.trace_region("reduce", payload=item):
-                        self.reduce(p, a * ROWS + lane, pos, epoch)
-            work.advance()
-        self.advance_epoch(p, tid, epoch)
-        return w, work
+    def attention_prologue(self, p, tid, warp, lane):
+        """Every CTA: the attention inputs ``xs[0 .. queries)`` from the layer's block
+        residuals (layer 0: the token's normalized embedding)."""
+        x = self.load_states(p, p.num_blocks, p.h, tid)
+        if p.embed_input != 0:
+            self.embed_token(p, x, MAX_BLOCKS, True, tid, warp, lane)
+        self.normalize_states(
+            p, x, p.num_blocks, p.attn_query, p.attn_norms, self.queries, p.queries, tid, warp,
+            lane,
+        )  # fmt: skip
+
+    @cute.jit
+    def attention_row(self, p, w, op, a, b, item, obuf, pos, epoch, tid, warp, lane):
+        """The compute warps' part of attention row ``(op, a, b)``. OPROJ rows alternate
+        their input buffer ``obuf`` (xs row ``streams`` or ``streams + 1``): every warp passed
+        the last merge's barrier after finishing the row before it, the last reader of this
+        buffer. Returns the weight ring's consumer and ``obuf``."""
+        if op == QKV:
+            vals, row, chans = self.engine.tile(
+                p, (w,), (), self.stream_of(b), self.hidden_k_tiles, warp, lane
+            )
+            w = chans[0]
+            if self.engine.owns_row(warp, lane):
+                index = self.proj_offset(b) + a * ROWS + row
+                publish(p.proj, index, bf16_round(vals[0]), epoch)
+        elif op == ATTN:
+            blk0, blk1, newest = self.split_blocks(pos, b)
+            if (blk0 == blk1) & (b != newest):
+                self.publish_empty_partial(p, a, b, epoch, tid)
+            else:
+                w = self.attention(p, w, a, b, pos, epoch, tid, warp, lane, item)
+        else:
+            obuf = 2 * self.streams + 1 - obuf
+            with self.trace_region("merge", payload=item):
+                if warp < self.heads_per_split:
+                    hq = b * self.heads_per_split + warp
+                    self.merge_head(p, hq, warp, obuf, epoch, lane)
+                self.csync.sync()
+            if a == 0:
+                self.store_kv_rows(p, b, pos, epoch, tid)
+            vals, row, chans = self.engine.tile(p, (w,), (), obuf, self.oproj_k_tiles, warp, lane)
+            w = chans[0]
+            if self.engine.owns_row(warp, lane):
+                publish(p.o_part, b * self.hidden + a * ROWS + row, vals[0], epoch)
+            if (b == O_SPLITS - 1) & (warp == 0):
+                with self.trace_region("reduce", payload=item):
+                    self.reduce_attention(p, a * ROWS + lane, pos, epoch)
+        return w, obuf
 
     # ------------------------------------------------------------ compute helpers
 
     @cute.jit
-    def embed_token(self, p: AttnParams, x, tid, warp, lane):
-        """The partial state ``x[MAX_BLOCKS]`` (``load_states`` read a stale ``h``) becomes the
-        token's embedding row through the weighted RMSNorm (``ref.hidden_states``' first ``h``),
-        which CTA 0 also stores to ``h`` for the launches after this one."""
+    def embed_token(self, p, x, slot: cutlass.Constexpr, store: cutlass.Constexpr, tid, warp,
+                    lane):  # fmt: skip
+        """State ``x[slot]`` (``load_states`` read a stale ``h`` there) becomes the token's
+        embedding row through the weighted RMSNorm (``ref.hidden_states``' first ``h``); with
+        ``store``, CTA 0 also stores it to ``h`` for the launches after this one (CTAs of this
+        launch recompute it rather than read it)."""
         per = self.hidden // COMPUTE_THREADS
         row = Int32(p.token[0])
         ss = Float32(0.0)
         for r in cutlass.range_constexpr(per):
             v = Float32(p.embed[row, r * COMPUTE_THREADS + tid])
-            x[MAX_BLOCKS, r] = v
+            x[slot, r] = v
             ss = ss + v * v
         ss = self.cta_sum(p, [ss], 0, warp, lane)[0]
         rinv = cute.math.rsqrt(ss * fp32_reciprocal(self.hidden) + Float32(self.rms_eps))
         first = cute.arch.block_idx()[0] == 0
         for r in cutlass.range_constexpr(per):
             k = r * COMPUTE_THREADS + tid
-            v = BFloat16(Float32(p.embed_norm[k]) * (x[MAX_BLOCKS, r] * rinv))
-            x[MAX_BLOCKS, r] = Float32(v)
-            if first:
-                p.h[k] = v
+            v = BFloat16(Float32(p.embed_norm[k]) * (x[slot, r] * rinv))
+            x[slot, r] = Float32(v)
+            if cutlass.const_expr(store):
+                if first:
+                    p.h[k] = v
         # The prologue's reductions reuse RED slot 0.
         self.csync.sync()
 
@@ -511,9 +380,7 @@ class InklingAttnKernel(InklingKernel):
         return first, last
 
     @cute.jit
-    def prepare_heads(
-        self, p: AttnParams, hq, kvh, pos, writer, first, last, epoch, tid, warp, lane
-    ):
+    def prepare_heads(self, p, hq, kvh, pos, writer, first, last, epoch, tid, warp, lane):
         """Fetch the item's projections into QKVS, then in place (one warp each): the q head's
         scale, L2 clip (and log scaling), the kv head's k and v convolutions (writing their
         ring rows when ``writer``), k's L2 clip and v's RMS norm, and the relative state's
@@ -599,7 +466,7 @@ class InklingAttnKernel(InklingKernel):
                 bias[d] = BFloat16(acc)
         self.csync.sync()
 
-    def bias_table(self, p: AttnParams):
+    def bias_table(self, p):
         """BIAS: the bf16 relative bias by distance (``extent`` entries). It reuses the first
         o_proj input row of X: every CTA runs its ATTN rows before its OPROJ rows."""
         return p.xs[self.streams, None]
@@ -620,7 +487,7 @@ class InklingAttnKernel(InklingKernel):
                 past[e, t] = ring[(pos - 1 - t + RING) % RING, c]
 
     @cute.jit
-    def conv_head(self, p: AttnParams, ring, base, dyn, kvh, pos, writer, lane, tap, past,
+    def conv_head(self, p, ring, base, dyn, kvh, pos, writer, lane, tap, past,
                   is_key: cutlass.Constexpr):  # fmt: skip
         """One warp: the k (``is_key``: then L2 clip) or v (then unweighted RMS norm) head at
         QKVS ``base`` through its short convolution, lane l on dims 4l .. 4l + 3, from
@@ -658,7 +525,7 @@ class InklingAttnKernel(InklingKernel):
             p.qkvs[base + 4 * lane + e] = bf16_round(z[e] * factor)
 
     @cute.jit
-    def score(self, p: AttnParams, dot, distance):
+    def score(self, p, dot, distance):
         """A key's softmax logit in log2 units from its 8 lanes' partial q.k ``dot``: the bf16
         score plus the relative bias at ``distance`` (BIAS; zero past the extent), rounded to
         bf16 as ``ref.attention``."""
@@ -669,7 +536,7 @@ class InklingAttnKernel(InklingKernel):
         return bf16_round(s + bias) * LOG2E
 
     @cute.jit
-    def attention(self, p: AttnParams, w, hq, split, pos, epoch, tid, warp, lane, item):
+    def attention(self, p, w, hq, split, pos, epoch, tid, warp, lane, item):
         """Flash-decoding partial of q head ``hq`` over KV split ``split``.
 
         Warp w scores positions 8w + 4i + g (i = 0, 1) of each 64-position block: lane group
@@ -773,7 +640,7 @@ class InklingAttnKernel(InklingKernel):
         return w
 
     @cute.jit
-    def merge_partials(self, p: AttnParams, hq, split, newest, d, epoch):
+    def merge_partials(self, p, hq, split, newest, d, epoch):
         """Merge the warps' online-softmax states in ATT (plus the new token's in the newest
         split) into this split's partial O (dim ``d``), m and l, and publish them."""
         att = p.att
@@ -799,7 +666,7 @@ class InklingAttnKernel(InklingKernel):
             publish(p.attn_ml, 2 * item + 1, den, epoch)
 
     @cute.jit
-    def publish_empty_partial(self, p: AttnParams, hq, split, epoch, tid):
+    def publish_empty_partial(self, p, hq, split, epoch, tid):
         """A split with no KV blocks at this position: m = -1e30, l = 0 (zero weight in the
         merge) and O = 0, published at once without waiting for QKV."""
         item = hq * self.splits + split
@@ -810,7 +677,7 @@ class InklingAttnKernel(InklingKernel):
             publish(p.attn_ml, 2 * item + 1, Float32(0.0), epoch)
 
     @cute.jit
-    def store_kv_rows(self, p: AttnParams, split, pos, epoch, tid):
+    def store_kv_rows(self, p, split, pos, epoch, tid):
         """Cache rows ``pos`` of the kv heads whose q heads o_proj split ``split`` covers, from
         their writers' published K/V, by row tile 0's item of the split after its merge: every
         ATTN item of those heads has then published its partial, after its last KV load, so no
@@ -829,7 +696,7 @@ class InklingAttnKernel(InklingKernel):
                 p.v_cache[kvh * max_len + pos, d] = BFloat16(vals[1])
 
     @cute.jit
-    def merge_head(self, p: AttnParams, hq, slot, obuf, epoch, lane):
+    def merge_head(self, p, hq, slot, obuf, epoch, lane):
         """One warp: q head ``hq``'s o_proj input at head slot ``slot`` of ``xs[obuf]``, lane l
         on dims 4l .. 4l + 3. The splits' partials merge with the sink logit in the softmax
         denominator; the bf16 output times the sigmoid gate is rounded to bf16, as
@@ -863,11 +730,11 @@ class InklingAttnKernel(InklingKernel):
             p.xs[obuf, slot * HEAD_DIM + d + e] = BFloat16(out * sig)
 
     @cute.jit
-    def reduce(self, p: AttnParams, col, pos, epoch):
+    def reduce_attention(self, p, col, pos, epoch):
         """Residual column ``col``, by one lane of warp 0: the bf16 o_proj output (the fp32 sum
         of the splits' partials in split order), written to the convolution ring at the
         position, then the post-attention convolution ``(conv + y) / sqrt(kernel + 1)`` (bf16)
-        plus ``h`` (unless the layer starts a block)."""
+        plus ``h`` (unless the layer starts a block), published to ``resid``."""
         taps = self.conv_kernel
         # The weights, ring rows and input load before the poll (their latency overlaps it).
         weights = cute.make_rmem_tensor((taps,), Float32)
@@ -892,219 +759,24 @@ class InklingAttnKernel(InklingKernel):
             conv = conv + weights[j] * cutlass.select_(src >= 0, Float32(past[j]), Float32(0.0))
         conv = conv + weights[taps - 1] * y
         z = bf16_round((conv + y) * fp32_reciprocal(math.sqrt(taps + 1)))
-        p.out[col] = cutlass.select_(p.boundary != 0, z, h + z)
+        publish(p.resid, col, cutlass.select_(p.boundary != 0, z, h + z), epoch)
 
-    # ----------------------------------------------------------------- kernel
-
-    @cute.kernel
-    def kernel(self, tma, gtensors, gate_tma, gate_g, scratch, tensors, blocks, bound, flags):
-        layouts = {
-            "W": cute.make_layout((ROWS, TILE_K, self.stages), stride=(TILE_K, 1, ROWS * TILE_K)),
-            "KV": cute.make_layout(
-                (BLOCK, HEAD_DIM, self.stages), stride=(HEAD_DIM, 1, BLOCK * HEAD_DIM)
-            ),
-            "X": cute.make_layout((self.streams + 2, self.hidden), stride=(self.hidden, 1)),
-            "RED": cute.make_layout(
-                (REDUCTIONS, COMPUTE_WARPS, RED_VALUES),
-                stride=(COMPUTE_WARPS * RED_VALUES, RED_VALUES, 1),
-            ),
-            "MIX": cute.make_layout((MIX_FLOATS,)),
-            "QKVS": cute.make_layout((QKVS_FLOATS,)),
-            "ATT": cute.make_layout((COMPUTE_WARPS + 1, HEAD_DIM + 2), stride=(HEAD_DIM + 2, 1)),
-        }
-        self.begin_roles(work=bound, layouts=layouts)
-        # Materialize the argument tensors in converged code: a first use inside one role's
-        # branch would not dominate the other roles' uses.
-        tensors = {k: cute.make_tensor(t.iterator, t.layout) for k, t in zip(TENSOR_ARGS, tensors)}
-        trace_buffer = tensors.pop("trace_buffer")
-        blocks = tuple(cute.make_tensor(t.iterator, t.layout) for t in blocks)
-        offsets = self.scratch_offsets
-        tagged = {
-            name: cute.make_tensor(scratch.iterator + offsets[name], cute.make_layout((size,)))
-            for name, size in self.scratch_shapes.items()
-        }
-        sW, sKV = self.buffer("W"), self.buffer("KV")
-        parts = []
-        weights = len(tma) - 2
-        for i, (atom, g) in enumerate(zip(tma, gtensors)):
-            is_kv = i >= weights
-            tile = (BLOCK, HEAD_DIM) if is_kv else (ROWS, TILE_K)
-            smem = sKV if is_kv else sW
-            tiles = cute.local_tile(g, tile, (None, None))
-            parts.append(
-                cpasync.tma_partition(
-                    atom,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(smem, 0, 2),
-                    cute.group_modes(tiles, 0, 2),
-                )
-            )
-        gate = self.gate_params(sW, gate_tma, gate_g, tagged, tensors)
-        num_blocks, queries, boundary, embed_input = flags
-        params = AttnParams(
-            tma=tuple(tma),
-            gmem=tuple(part[1] for part in parts),
-            sW=StageView(parts[0][0], axis=1),
-            sKV=StageView(parts[weights][0], axis=1),
-            xs=self.buffer("X"),
-            red=self.buffer("RED"),
-            mix=self.buffer("MIX"),
-            qkvs=self.buffer("QKVS"),
-            att=self.buffer("ATT"),
-            gate=gate,
-            blocks=blocks,
-            num_blocks=num_blocks,
-            queries=queries,
-            boundary=boundary,
-            embed_input=embed_input,
-            **tagged,
-            **tensors,
-        )
-        self.run_roles(params, trace_buffer=trace_buffer)
+    # ------------------------------------------------------------- TMA atoms
 
     @cute.jit
-    def __call__(
-        self,
-        wq: cute.Tensor,
-        wk: cute.Tensor,
-        wv: cute.Tensor,
-        wrel: cute.Tensor,
-        k_dynamic: cute.Tensor,
-        v_dynamic: cute.Tensor,
-        wgate: cute.Tensor,
-        wsink: cute.Tensor,
-        wo: cute.Tensor,
-        k_cache: cute.Tensor,
-        v_cache: cute.Tensor,
-        query: cute.Tensor,
-        norms: cute.Tensor,
-        q_scale: cute.Tensor,
-        rel_scale: cute.Tensor,
-        rel_proj: cute.Tensor,
-        k_taps: cute.Tensor,
-        v_taps: cute.Tensor,
-        attn_conv: cute.Tensor,
-        gate_down: cute.Tensor,
-        gate_fg: cute.Tensor,
-        mhalf: cute.Tensor,
-        messages: cute.Tensor,
-        embed: cute.Tensor,
-        embed_norm: cute.Tensor,
-        h: cute.Tensor,
-        block0: cute.Tensor,
-        block1: cute.Tensor,
-        block2: cute.Tensor,
-        block3: cute.Tensor,
-        num_blocks: Int32,
-        queries: Int32,
-        boundary: Int32,
-        embed_input: Int32,
-        ring_k: cute.Tensor,
-        ring_v: cute.Tensor,
-        ring_attn: cute.Tensor,
-        token: cute.Tensor,
-        pos: cute.Tensor,
-        out: cute.Tensor,
-        trace_buffer: cute.Tensor,
-        scratch: cute.Tensor,
-        state: cute.Tensor,
-        table: cute.Tensor,
-        workspace: cute.Tensor,
-        max_ctas: Int32,
-        stream: cuda.CUstream,
-    ):
-        # In the order of self.matrices (sliding layers have no dynamic taps), then wo and the
-        # caches.
-        by_matrix = {Q: wq, K: wk, V: wv, REL: wrel, KDYN: k_dynamic, VDYN: v_dynamic,
-                     GATE: wgate, SINK: wsink}  # fmt: skip
+    def attention_atoms(self, by_matrix: dict, wo, k_cache, v_cache):
+        """TMA ``(atom, tensor)`` pairs: 32 x 256 weight tiles of the projection matrices in
+        ``matrices`` order (sliding layers have no dynamic taps) and of wo, then 64 x 128 KV
+        blocks of the caches."""
         op = cpasync.CopyBulkTensorTileG2SOp()
         w_smem = cute.make_layout((ROWS, TILE_K), stride=(TILE_K, 1))
         kv_smem = cute.make_layout((BLOCK, HEAD_DIM), stride=(HEAD_DIM, 1))
-        pairs = [
+        weights = [
             cpasync.make_tiled_tma_atom(op, src, w_smem, (ROWS, TILE_K))
             for src in [by_matrix[m] for m in self.matrices] + [wo]
         ]
-        pairs += [
+        caches = [
             cpasync.make_tiled_tma_atom(op, src, kv_smem, (BLOCK, HEAD_DIM))
             for src in (k_cache, v_cache)
         ]
-        gate_pairs = []
-        if cutlass.const_expr(self.messages):
-            gate_pairs = gate_atoms(gate_down, gate_fg, self.hidden)
-        bound = self.work.bind(table, workspace, max_ctas)
-        tensors = (trace_buffer, state, pos, token, embed, embed_norm, h, query, norms, q_scale,
-                   rel_scale, rel_proj, k_taps, v_taps, attn_conv, ring_k, ring_v, ring_attn,
-                   k_cache, v_cache, mhalf, messages, out)  # fmt: skip
-        self.kernel.set_name_prefix(self.get_name())
-        self.kernel(
-            tuple(a for a, _ in pairs),
-            tuple(g for _, g in pairs),
-            tuple(a for a, _ in gate_pairs),
-            tuple(g for _, g in gate_pairs),
-            scratch,
-            tensors,
-            (block0, block1, block2, block3),
-            bound,
-            (num_blocks, queries, boundary, embed_input),
-        ).launch(**self.launch_config(bound), stream=stream)
-
-
-@jit_cache
-def compile_attn_kernel(op: InklingAttnKernel):
-    """One compile per layer kind serves every visit, layer and position: weights, caches and
-    states are arguments; the position, token, block count, query, boundary and embedding
-    flags and the cache capacity are read at run time."""
-    bf16, f32 = BFloat16, Float32
-    h, qh, kv_dim = op.hidden, op.q_heads, op.kv_dim
-    cache_rows = cute.sym_int(divisibility=BLOCK)
-    taps = op.kv_heads * op.conv_kernel
-    if op.full:  # static taps (kernel, channel), tap 0 the current token
-        tap_shape, tap_dtype = (op.conv_kernel, kv_dim), bf16
-    else:  # (channel, kernel), the last tap the current token
-        tap_shape, tap_dtype = (kv_dim, op.conv_kernel), f32
-    vector = [make_fake_compact_tensor(bf16, (h,), assumed_align=2) for _ in range(MAX_BLOCKS)]
-    return compile_tvm_ffi(
-        op,
-        make_fake_compact_tensor(bf16, (qh * HEAD_DIM, h)),  # wq
-        make_fake_compact_tensor(bf16, (kv_dim, h)),  # wk
-        make_fake_compact_tensor(bf16, (kv_dim, h)),  # wv
-        make_fake_compact_tensor(bf16, (qh * op.d_rel, h)),  # wrel
-        make_fake_compact_tensor(bf16, (taps, h)),  # k_dynamic (unread in sliding layers)
-        make_fake_compact_tensor(bf16, (taps, h)),  # v_dynamic
-        make_fake_compact_tensor(bf16, (qh * HEAD_DIM, h)),  # wgate
-        make_fake_compact_tensor(bf16, (qh, h)),  # wsink
-        make_fake_compact_tensor(bf16, (h, qh * HEAD_DIM)),  # wo
-        make_fake_compact_tensor(bf16, (cache_rows, HEAD_DIM)),
-        make_fake_compact_tensor(bf16, (cache_rows, HEAD_DIM)),
-        make_fake_compact_tensor(f32, (op.queries, h), assumed_align=4),  # queries
-        make_fake_compact_tensor(bf16, (op.streams, h), assumed_align=2),  # norms
-        make_fake_compact_tensor(bf16, (qh, HEAD_DIM), assumed_align=2),
-        make_fake_compact_tensor(bf16, (qh, op.d_rel), assumed_align=2),
-        make_fake_compact_tensor(bf16, (op.rel_width, op.d_rel), assumed_align=16),
-        make_fake_compact_tensor(tap_dtype, tap_shape, assumed_align=2),
-        make_fake_compact_tensor(tap_dtype, tap_shape, assumed_align=2),
-        make_fake_compact_tensor(f32, (h, op.conv_kernel), assumed_align=4),
-        *fake_gate_args(h),
-        make_fake_compact_tensor(bf16, (cute.sym_int(), h)),  # embedding table
-        make_fake_compact_tensor(bf16, (h,), assumed_align=2),  # embedding norm
-        make_fake_compact_tensor(bf16, (h,), assumed_align=2),  # h
-        *vector,
-        Int32(1),
-        Int32(1),
-        Int32(0),
-        Int32(0),
-        make_fake_compact_tensor(bf16, (RING, kv_dim), assumed_align=2),
-        make_fake_compact_tensor(bf16, (RING, kv_dim), assumed_align=2),
-        make_fake_compact_tensor(bf16, (RING, h), assumed_align=2),
-        make_fake_compact_tensor(Int64, (1,), assumed_align=8),  # token
-        make_fake_compact_tensor(Int32, (1,), assumed_align=4),  # pos
-        make_fake_compact_tensor(f32, (h,), assumed_align=4),
-        make_fake_compact_tensor(Int64, (cute.sym_int(),)),  # trace buffer (globaltimer only)
-        make_fake_compact_tensor(Int64, (op.scratch_size,)),
-        make_fake_compact_tensor(Int32, (2,), assumed_align=4),
-        make_fake_compact_tensor(Int32, (cute.sym_int(), WORDS)),
-        make_fake_compact_tensor(Int32, (cute.sym_int(),)),
-        Int32(1),
-        name=op.get_name(),
-    )
+        return weights, caches

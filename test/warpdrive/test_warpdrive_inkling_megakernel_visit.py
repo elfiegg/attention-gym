@@ -1,8 +1,11 @@
-"""The Inkling 2 Mini attention-half megakernel launch (``inkling_megakernel.megakernel``)
-against ``ref.attention_block`` with ``start=None``: block residual inputs, projections,
-k/v convolutions, clips, relative bias, window, sink, gate, o_proj, post-attention convolution
-and residual, for sliding and full layers; the cache and ring rows it writes; a CUDA graph
-replay and compile reuse across positions; and the hybrid decode step on the checkpoint."""
+"""The Inkling 2 Mini visit launch (``inkling_megakernel.megakernel.InklingVisitMegakernel``):
+its attention half against ``ref.attention_block`` with ``start=None`` (block residual inputs,
+projections, k/v convolutions, clips, relative bias, window, sink, gate, o_proj,
+post-attention convolution and residual, for sliding and full layers; the cache and ring rows
+it writes), its MLP half against ``ref.mlp_block`` on the launch's own post-attention residual
+(routing, block residual, experts, post-MLP convolution and residual), a CUDA graph replay and
+compile reuse across positions, on random weights at the real shapes and on the checkpoint's
+own visits."""
 
 import dataclasses
 import gc
@@ -14,13 +17,9 @@ pytest.importorskip("cutlass.cute")
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.warpdrive.examples.inkling_megakernel import ref
-from attn_gym.warpdrive.examples.inkling_megakernel.attn_kernel import compile_attn_kernel
 from attn_gym.warpdrive.examples.inkling_megakernel.fast import FAST, decode_step
-from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
-    InklingAttnMegakernel,
-    InklingMegakernel,
-    decode_step_megakernel,
-)
+from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import InklingVisitMegakernel
+from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import compile_visit_kernel
 
 CONFIG = ref.InklingConfig()
 MODEL = "thinkingmachines/Inkling-2-Mini"
@@ -34,6 +33,13 @@ MAX_ULPS, MAX_MEDIAN_ULPS = 8.0, 0.5
 # convolution, clip and norm can carry such a flip of a large element into two ulps of a
 # smaller cache element.
 RING_ULPS, CACHE_ULPS = 1.0, 2.0
+# The MLP output differs from the oracle's on the same residual only through fp32 summation
+# order, which can flip a bf16 rounding of a gate/up or down output and so move a few output
+# elements by an ulp of the summands' scale: bounded in ulps of a bf16 value at the expected
+# output's RMS, and in the fraction of changed elements. One flipped gate/up activation moves
+# every down output of its expert a little: on the checkpoint's visits 0.0-0.11 of the outputs
+# change on the oracle's residuals, 0.0-0.23 on the launch's own (max 4 ulps).
+MLP_ULPS, MLP_MAX_CHANGED = 8.0, 0.3
 
 
 @pytest.fixture(autouse=True)
@@ -48,11 +54,10 @@ def require_sm100():
         pytest.skip("the megakernel requires an SM100-family GPU")
 
 
-def random_layer(config: ref.InklingConfig, layer: int, seed: int) -> ref.LayerWeights:
+def random_attention(config: ref.InklingConfig, layer: int, gen) -> dict:
     """Attention weights of ``layer`` (full or sliding, with or without a block-residual query)
     at ``config``'s shapes, scaled so q clips sometimes, scores and biases spread over a few
-    units and outputs have unit scale; MLP weights are empty placeholders."""
-    gen = torch.Generator(device="cuda").manual_seed(seed)
+    units and outputs have unit scale."""
     h, heads, kv, d = config.hidden_size, config.num_q_heads, config.kv_dim, config.head_dim
     kernel, rel = config.conv_kernel, config.d_rel
 
@@ -65,10 +70,6 @@ def random_layer(config: ref.InklingConfig, layer: int, seed: int) -> ref.LayerW
     def norm():
         return (1 + randn(h, scale=0.1)).bfloat16()
 
-    empty = torch.empty(0, device="cuda")
-    mlp = dict.fromkeys(
-        ("mlp_conv", "post_norm", "mlp_query", "router", "router_bias", "w13", "w2"), empty
-    )
     fields = {
         "wq": weight(heads * d, h),
         "wk": weight(kv, h, 0.5),
@@ -101,7 +102,32 @@ def random_layer(config: ref.InklingConfig, layer: int, seed: int) -> ref.LayerW
             k_conv=randn(kv, kernel, scale=0.3),
             v_conv=randn(kv, kernel, scale=0.3),
         )
-    return ref.LayerWeights(**fields, **mlp)
+    return fields
+
+
+def random_mlp(config: ref.InklingConfig, gen) -> dict:
+    """MLP weights at ``config``'s shapes, scaled like a trained layer's (unit gate/up and down
+    outputs)."""
+    h, width, experts = config.hidden_size, config.moe_intermediate_size, config.num_experts
+
+    def randn(*shape, scale=1.0):
+        return torch.randn(*shape, device="cuda", generator=gen) * scale
+
+    return {
+        "mlp_conv": randn(h, config.conv_kernel, scale=0.3),
+        "post_norm": (1 + randn(h, scale=0.1)).bfloat16(),
+        "mlp_query": randn(h),
+        "router": randn(experts, h, scale=h**-0.5).bfloat16().float(),  # bf16-exact, as Inkling's
+        "router_bias": randn(experts, scale=0.05),
+        "w13": randn(experts, 2 * width, h, scale=h**-0.5).bfloat16(),
+        "w2": randn(experts, h, width, scale=width**-0.5).bfloat16(),
+    }
+
+
+def random_layer(config: ref.InklingConfig, layer: int, seed: int) -> ref.LayerWeights:
+    """Both halves' random weights of ``layer`` (no message gates)."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    return ref.LayerWeights(**random_attention(config, layer, gen), **random_mlp(config, gen))
 
 
 def random_cache(config: ref.InklingConfig, visits: int, max_len: int, seed: int):
@@ -142,30 +168,45 @@ def ulps(out: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
     return (out.float() - expected).abs() / 2.0 ** (exponent - 7)
 
 
+def scale_ulps(out: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
+    """|out - expected| in ulps of a bf16 value at the expected tensor's RMS."""
+    rms = expected.float().square().mean().sqrt()
+    return (out.float() - expected.float()).abs() / 2.0 ** (torch.floor(torch.log2(rms)) - 7)
+
+
 def clone(cache: ref.InklingCache) -> ref.InklingCache:
     return ref.InklingCache(**{k: v.clone() for k, v in vars(cache).items()})
 
 
 def check_visit(
-    runner, config, w, layer, visit, h, blocks, cache, positions, messages=None, gates=None
+    runner,
+    config,
+    w,
+    layer,
+    visit,
+    h,
+    blocks,
+    cache,
+    positions,
+    messages=None,
+    gates=None,
+    mlp_max_changed=MLP_MAX_CHANGED,
 ):
-    """One launch against ``ref.attention_block`` (``start=None``) on a copy of ``cache``:
-    the residual and the attention ring row within ``MAX_ULPS``, the k/v cache and ring rows
-    within theirs, every other row untouched. A visit with ``messages`` (the oracle's
-    ``(1, 4, hidden)``) launches with the matching ``gates`` (``megakernel.GateArgs``).
-    Returns the residual's error (``ulps`` of the post-attention output)."""
+    """One launch against the oracle on a copy of ``cache``. Attention: ``ref.attention_block``
+    (``start=None``) on the launch's inputs: the residual and the attention ring row within
+    ``MAX_ULPS``, the k/v cache and ring rows within theirs, every other row untouched. MLP:
+    ``ref.mlp_block`` on the launch's own residual: the same experts, the output and the MLP
+    ring's new row within ``MLP_ULPS`` (at most ``mlp_max_changed`` of the outputs changed),
+    every other ring row untouched. A visit with ``messages`` (the oracle's ``(1, 4, hidden)``)
+    launches with the matching ``gates`` (``megakernel.GateArgs``). Returns the residual's and
+    the output's errors (``ulps`` of the post-attention output, ``scale_ulps``) and the
+    launch's residual."""
     theirs = clone(cache)
-    expected, expected_blocks = ref.attention_block(
+    expected, mlp_blocks = ref.attention_block(
         config, w, layer, visit, h, blocks, messages, theirs, positions, None, FAST
     )
-    if gates is None:
-        residual, out_blocks = runner.attention_block(
-            config, w, layer, visit, h, blocks, None, cache, positions, None, FAST
-        )
-        assert len(out_blocks) == len(expected_blocks)
-        assert all(a is b for a, b in zip(out_blocks, expected_blocks))
-    else:
-        residual = runner(w, layer, visit, h, blocks, cache, positions, gates=gates)[None]
+    out = runner(w, layer, visit, h, blocks, cache, positions, gates=gates)
+    residual = runner.residual(layer, gates is not None)[None]
     boundary = layer % config.block_layers == 0
     attn_out = expected[0] if boundary else expected[0] - h[0].float()
     errors = ulps(residual[0] - expected[0] + attn_out, attn_out)
@@ -186,12 +227,30 @@ def check_visit(
         errors.max(),
         errors.median(),
     )
-    return errors
+
+    message = None if messages is None else messages[:, 3]
+    expected = ref.mlp_block(
+        config, w, visit, residual, mlp_blocks, message, theirs, positions, ref.REFERENCE
+    )
+    x = ref.block_residual(w.mlp_query[None], mlp_blocks, residual)[:, 0]
+    if message is not None:
+        x = ref.message_gate(w.gates[3], x, message, config.rms_eps)
+    x = ref.rms_norm(x, w.post_norm, config.rms_eps).to(torch.bfloat16)
+    experts = ref.route(config, w, x)[0][0].sort().values
+    assert torch.equal(runner.routed_experts(w, layer, gates is not None), experts)
+    out_errors = scale_ulps(out, expected[0])
+    changed = (out_errors > 0).float().mean()
+    assert out_errors.max() <= MLP_ULPS and changed <= mlp_max_changed, out_errors.max()
+    ring, ref_ring = cache.conv_mlp[visit], theirs.conv_mlp[visit]
+    assert torch.equal(ring[others], ref_ring[others])
+    assert scale_ulps(ring[slot], ref_ring[slot]).max() <= MLP_ULPS
+    return errors, out_errors, residual
 
 
 CASES = [
-    # (layer, blocks, positions): sliding layer 0 (no query, a block boundary), a sliding
-    # layer inside a block, a sliding boundary layer with a query, full layers.
+    # (layer, blocks, positions): sliding layer 0 (no query, a block boundary: the MLP reads h
+    # as its only block), a sliding layer inside a block, a sliding boundary layer with a
+    # query, full layers; the MLP half reads 1 to 4 blocks.
     (0, 0, (0, 1, 63, 64, 1100)),
     (1, 1, (1, 63, 64, 1100)),
     (6, 2, (65, 1100)),
@@ -202,20 +261,23 @@ CASES = [
 
 @pytest.mark.parametrize("layer,blocks,positions", CASES)
 @torch.no_grad()
-def test_attention_block_random_weights(layer, blocks, positions):
+def test_visit_random_weights(layer, blocks, positions):
     """Position 0 (only the new token and the sink), positions before the convolution history
     fills, at and across a KV block edge, and past the sliding window (1100 keys: sliding
-    layers must read only the last 1024); several launches through one runner (the epoch advances)."""
+    layers must read only the last 1024); several launches through one runner (the epoch
+    advances)."""
     require_sm100()
     w = random_layer(CONFIG, layer, seed=layer)
-    runner = InklingAttnMegakernel(CONFIG, (w,))
+    runner = InklingVisitMegakernel(CONFIG, (w,))
     cache = random_cache(CONFIG, visits=2, max_len=1152, seed=layer)
     for case, pos in enumerate(positions):
         h, states = random_inputs(CONFIG, blocks, seed=100 * layer + case)
-        errors = check_visit(
-            runner, CONFIG, w, layer, 1, h, states, cache, torch.tensor([pos], device="cuda")
+        positions_ = torch.tensor([pos], device="cuda")
+        errors, out_errors, _ = check_visit(
+            runner, CONFIG, w, layer, 1, h, states, cache, positions_
         )
-        print(f"layer {layer} pos {pos}: max {errors.max():.2f} median {errors.median():.2f} ulps")
+        print(f"layer {layer} pos {pos}: attention max {errors.max():.2f} median "
+              f"{errors.median():.2f} ulps, MLP max {out_errors.max():.2f}")  # fmt: skip
 
 
 @torch.no_grad()
@@ -224,7 +286,7 @@ def test_full_layer_log_scaling():
     require_sm100()
     layer = 11
     w = random_layer(CONFIG, layer, seed=7)
-    runner = InklingAttnMegakernel(CONFIG, (w,))
+    runner = InklingVisitMegakernel(CONFIG, (w,))
     cache = random_cache(CONFIG, visits=1, max_len=9024, seed=7)
     h, states = random_inputs(CONFIG, 2, seed=7)
     check_visit(runner, CONFIG, w, layer, 0, h, states, cache, torch.tensor([9000], device="cuda"))
@@ -237,14 +299,14 @@ def test_graph_replay_and_compile_reuse():
     runtime values: varying them compiles nothing."""
     require_sm100()
     w = random_layer(CONFIG, 1, seed=1)
-    runner = InklingAttnMegakernel(CONFIG, (w,))
+    runner = InklingVisitMegakernel(CONFIG, (w,))
     cache = random_cache(CONFIG, visits=1, max_len=1152, seed=1)
     initial = clone(cache)
     h, states = random_inputs(CONFIG, 1, seed=2)
     positions = torch.tensor([1030], device="cuda")
-    out = torch.empty(CONFIG.hidden_size, device="cuda")
+    out = torch.empty(CONFIG.hidden_size, device="cuda", dtype=torch.bfloat16)
     runner(w, 1, 0, h, states, cache, positions, out)
-    entries = compile_attn_kernel.cache_info().currsize
+    entries = compile_visit_kernel.cache_info().currsize
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -258,21 +320,23 @@ def test_graph_replay_and_compile_reuse():
         positions.fill_(pos)
         expected_cache = clone(initial)
         expected = runner(w, 1, 0, h, states, expected_cache, positions).clone()
+        expected_residual = runner.residual(1).clone()
         for name, tensor in vars(cache).items():
             tensor.copy_(getattr(initial, name))
         out.zero_()
         graph.replay()
         assert torch.equal(out, expected), pos
+        assert torch.equal(runner.residual(1), expected_residual), pos
         for name, tensor in vars(cache).items():
             assert torch.equal(tensor, getattr(expected_cache, name)), (pos, name)
 
-    before = compile_attn_kernel.cache_info()
+    before = compile_visit_kernel.cache_info()
     other = random_cache(CONFIG, visits=1, max_len=2048, seed=3)
     for pos, blocks, target in [(0, 0, cache), (64, 4, cache), (2000, 2, other), (1100, 3, other)]:
         positions.fill_(pos)
         h, states = random_inputs(CONFIG, blocks, seed=pos)
         runner(w, 1, 0, h, states, target, positions)
-    info = compile_attn_kernel.cache_info()
+    info = compile_visit_kernel.cache_info()
     assert info.currsize == entries
     assert info.misses == before.misses
     assert info.hits + info.misses == before.hits + before.misses + 4  # one per eager launch
@@ -295,36 +359,34 @@ def checkpoint_weights():
 
 @pytest.mark.xdist_group("inkling-checkpoint")
 @torch.no_grad()
-def test_checkpoint_visits_and_hybrid_step():
-    """Every plain visit of a decode step after a prefill on Inkling 2 Mini: the launch stays
-    within the budget of ``ref.attention_block`` on the visit's own inputs. Then the hybrid step
-    with both halves (``InklingMegakernel``) against ``fast.decode_step``: close logits, the
-    same next token. Skips unless the checkpoint is cached; never downloads."""
+def test_checkpoint_visits():
+    """Every plain visit of a decode step after a prefill on Inkling 2 Mini: the launch on the
+    visit's own inputs stays within ``check_visit``'s budgets of ``ref.attention_block`` and of
+    ``ref.mlp_block`` on its residual, and routes to the oracle's experts. Skips unless the
+    checkpoint is cached; never downloads."""
     require_sm100()
     weights = checkpoint_weights()
     config = weights.config
-    runner = InklingMegakernel(config, weights.layers)
+    runner = InklingVisitMegakernel(config, weights.layers)
     cache = ref.InklingCache.empty(config, max_len=128)
     prompt = torch.arange(1000, 1040, device="cuda")
     token = ref.forward_tokens(weights, prompt, 0, cache).argmax().reshape(1)
     pos = torch.tensor([prompt.numel()], device="cuda")
-    start = clone(cache)
 
     visits = []
 
     def spy(config, w, layer, visit, h, blocks, messages, cache, positions, start, kernels):
         if messages is None:
-            check_visit(runner.attn, config, w, layer, visit, h, blocks, clone(cache), positions)
+            errors, out_errors, _ = check_visit(
+                runner, config, w, layer, visit, h, blocks, clone(cache), positions
+            )
+            print(f"visit {visit}: attention max {errors.max():.2f} median "
+                  f"{errors.median():.2f} ulps, MLP max {out_errors.max():.2f}")  # fmt: skip
             visits.append(visit)
         return ref.attention_block(
             config, w, layer, visit, h, blocks, messages, cache, positions, start, kernels
         )
 
-    spying = dataclasses.replace(FAST, attention_block=spy)
-    expected = decode_step(weights, token, pos, cache, spying)
+    decode_step(weights, token, pos, cache, dataclasses.replace(FAST, attention_block=spy))
     plain = [v for v, layer, p in config.visits() if not (config.is_loop(layer) and p > 0)]
     assert visits == plain
-
-    logits = decode_step_megakernel(weights, token, pos, start, runner)
-    assert logits.argmax() == expected.argmax()
-    torch.testing.assert_close(logits, expected, atol=0.5, rtol=0)

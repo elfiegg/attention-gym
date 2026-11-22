@@ -15,21 +15,25 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass.cute")
 
-from test_warpdrive_inkling_megakernel_attn import CONFIG, MODEL, clone, require_sm100
 from test_warpdrive_inkling_megakernel_messages import random_core_layer
-from test_warpdrive_inkling_megakernel_mlp import scale_ulps
+from test_warpdrive_inkling_megakernel_visit import (
+    CONFIG,
+    MODEL,
+    clone,
+    require_sm100,
+    scale_ulps,
+)
 
 from attn_gym.warpdrive.examples.inkling_megakernel import ref
-from attn_gym.warpdrive.examples.inkling_megakernel.attn_kernel import compile_attn_kernel
 from attn_gym.warpdrive.examples.inkling_megakernel.head_kernel import compile_head_kernel
 from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
     InklingDecoder,
     InklingHeadMegakernel,
 )
-from attn_gym.warpdrive.examples.inkling_megakernel.mlp_kernel import compile_mlp_kernel
 from attn_gym.warpdrive.examples.inkling_megakernel.msg_kernel import compile_msg_kernel
+from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import compile_visit_kernel
 
-COMPILES = (compile_attn_kernel, compile_mlp_kernel, compile_msg_kernel, compile_head_kernel)
+COMPILES = (compile_visit_kernel, compile_msg_kernel, compile_head_kernel)
 PROMPT = "What is the capital of France? One sentence."
 STEPS = 40
 # Logits differ from the oracle's where a bf16 rounding of an LM-head output or of the

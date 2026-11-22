@@ -1,11 +1,10 @@
 """The Inkling 2 Mini message launches (``inkling_megakernel.megakernel``) on random weights at
 the real shapes: a pass's messages and message halves (``InklingMsgMegakernel``) against
-``ref.block_residual`` and the gates' down projections, and the attention and MLP halves of
-core visits after the first pass, whose inputs pass through the message gates, against
+``ref.block_residual`` and the gates' down projections, and the visit launch of core visits
+after the first pass, whose attention and MLP inputs pass through the message gates, against
 ``ref.attention_block`` and ``ref.mlp_block`` with the oracle's messages; a CUDA graph replay
 of a whole message visit and compile reuse across positions."""
 
-import dataclasses
 import gc
 
 import pytest
@@ -14,29 +13,27 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass.cute")
 
-from test_warpdrive_inkling_megakernel_attn import (
+from test_warpdrive_inkling_megakernel_visit import (
     CONFIG,
+    check_visit,
     clone,
+    random_attention,
     random_cache,
     random_inputs,
+    random_mlp,
     require_sm100,
 )
-from test_warpdrive_inkling_megakernel_attn import check_visit as check_attention
-from test_warpdrive_inkling_megakernel_attn import random_layer as random_attention_layer
-from test_warpdrive_inkling_megakernel_mlp import check_visit as check_mlp
-from test_warpdrive_inkling_megakernel_mlp import random_layer as random_mlp_layer
 
 from attn_gym.warpdrive.examples.inkling_megakernel import ref
-from attn_gym.warpdrive.examples.inkling_megakernel.attn_kernel import compile_attn_kernel
-from attn_gym.warpdrive.examples.inkling_megakernel.common import GATE_SPLITS
+from attn_gym.warpdrive.examples.inkling_megakernel.common import GATE_SPLITS, GATES
 from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
-    InklingAttnMegakernel,
-    InklingMlpMegakernel,
     InklingMsgMegakernel,
+    InklingVisitMegakernel,
     MessageGates,
+    tagged_values,
 )
-from attn_gym.warpdrive.examples.inkling_megakernel.mlp_kernel import compile_mlp_kernel
 from attn_gym.warpdrive.examples.inkling_megakernel.msg_kernel import compile_msg_kernel
+from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import compile_visit_kernel
 
 
 @pytest.fixture(autouse=True)
@@ -47,9 +44,9 @@ def release_cuda_memory():
 
 
 def random_core_layer(config: ref.InklingConfig, layer: int, seed: int) -> ref.LayerWeights:
-    """A core layer at ``config``'s shapes: the attention and MLP tests' random weights and four
-    message gates whose down projections give unit-scale ``h`` and whose forget and gain
-    projections spread ``tanh`` over its range."""
+    """A core layer at ``config``'s shapes: the visit tests' random weights and four message
+    gates whose down projections give unit-scale ``h`` and whose forget and gain projections
+    spread ``tanh`` over its range."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     h, rank = config.hidden_size, config.gate_rank
 
@@ -64,10 +61,9 @@ def random_core_layer(config: ref.InklingConfig, layer: int, seed: int) -> ref.L
         )
         for _ in range(4)
     )
-    mlp = random_mlp_layer(config, seed)
-    fields = {name: getattr(mlp, name) for name in
-              ("mlp_conv", "post_norm", "mlp_query", "router", "router_bias", "w13", "w2")}  # fmt: skip
-    return dataclasses.replace(random_attention_layer(config, layer, seed), **fields, gates=gates)
+    attention = random_attention(config, layer, torch.Generator(device="cuda").manual_seed(seed))
+    mlp = random_mlp(config, torch.Generator(device="cuda").manual_seed(seed))
+    return ref.LayerWeights(**attention, **mlp, gates=gates)
 
 
 def random_pass(config: ref.InklingConfig, layers: int, seed: int):
@@ -85,34 +81,29 @@ def oracle_messages(queries, block, partial):
     return torch.stack([ref.block_residual(q, [block], partial) for q in queries])
 
 
-def tagged(launch, name: str, count: int) -> torch.Tensor:
-    """The fp32 values of a launch's tagged scratch buffer ``name``."""
-    offset = launch.op.scratch_offsets[name]
-    return launch.scratch[offset : offset + count].view(torch.int32)[0::2].view(torch.float32)
-
-
-def check_gates(config, launch, w, first: int, streams, messages, gates):
-    """The last launch's gates ``first ..`` on their fp32 input ``streams``: ``h`` within one
-    bf16 ulp of ``ref.message_gate``'s bf16 GEMM, and the gated streams equal to the oracle's
-    gate evaluated on the kernel's own ``h`` up to fp32 rounding. (An ``h`` rounding flip moves
-    every gated element by about 1e-3 relative: the launch outputs differ from the oracle's
-    through those flips, not through the gate arithmetic.) Returns the count of flipped ``h``."""
-    count, h, rank = launch.op.gates, config.hidden_size, config.gate_rank
-    h_part = tagged(launch, "h_part", GATE_SPLITS * count * rank).view(GATE_SPLITS, count, rank)
-    gated = tagged(launch, "gated", count * h).view(count, h)
+def check_gates(config, launch, w, streams, messages, gates):
+    """The last launch's message gates on their fp32 input ``streams`` (``(GATES, hidden)``):
+    ``h`` within one bf16 ulp of ``ref.message_gate``'s bf16 GEMM, and the gated streams equal
+    to the oracle's gate evaluated on the kernel's own ``h`` up to fp32 rounding. (An ``h``
+    rounding flip moves every gated element by about 1e-3 relative: the launch outputs differ
+    from the oracle's through those flips, not through the gate arithmetic.) Returns the count
+    of flipped ``h`` per gate."""
+    h, rank = config.hidden_size, config.gate_rank
+    h_part = tagged_values(launch, "h_part").view(GATE_SPLITS, GATES, rank)
+    gated = tagged_values(launch, "gated").view(GATES, h)
     mhalf = gates.mhalf.view(-1, rank)
-    flips = 0
-    for s in range(count):
-        gate, x, m = w.gates[first + s], streams[s], messages[0, first + s]
+    flips = []
+    for s in range(GATES):
+        gate, x, m = w.gates[s], streams[s], messages[0, s]
         inputs = torch.cat([ref.rms_norm(v, None, config.rms_eps) for v in (x, m)])
         expected = F.linear(inputs.bfloat16(), gate.down).float()
         mine = h_part[0, s]
         for k in range(1, GATE_SPLITS):  # the kernel's summation order
             mine = mine + h_part[k, s]
-        mine = (mine + mhalf[first + s]).bfloat16().float()
+        mine = (mine + mhalf[s]).bfloat16().float()
         ulp = 2.0 ** (torch.floor(torch.log2(expected.abs())) - 7)
         assert ((mine - expected).abs() <= ulp).all(), s
-        flips += int((mine != expected).sum())
+        flips.append(int((mine != expected).sum()))
         out = (1 - torch.tanh(gate.forget @ mine)) * x + torch.tanh(gate.gain @ mine) * m
         torch.testing.assert_close(gated[s], out, rtol=1e-5, atol=1e-5)
     return flips
@@ -156,10 +147,10 @@ VISITS = [(7, 2, (1, 1100)), (12, 2, (64, 300)), (11, 2, (3, 1100)), (17, 3, (70
 @pytest.mark.parametrize("layer,blocks,positions", VISITS)
 @torch.no_grad()
 def test_message_visit_random_weights(layer, blocks, positions):
-    """Both halves of a core visit after the first pass: the message launch, then the attention
-    launch (q, k, v gates) against ``ref.attention_block`` and the MLP launch (MLP gate) against
-    ``ref.mlp_block``, each on the oracle's inputs and messages, within the plain launches'
-    budgets."""
+    """A core visit after the first pass: the message launch, then the visit launch (q, k, v
+    gates on the attention's inputs, the MLP gate on the MLP's) against ``ref.attention_block``
+    on the oracle's inputs and messages and ``ref.mlp_block`` on the launch's residual, within
+    the plain visits' budgets; the gates themselves against ``ref.message_gate``."""
     require_sm100()
     config = CONFIG
     w = random_core_layer(config, layer, seed=layer)
@@ -167,33 +158,26 @@ def test_message_visit_random_weights(layer, blocks, positions):
     gates = MessageGates((w,), queries)
     InklingMsgMegakernel(config, gates)(block, partial)
     messages = oracle_messages(queries, block, partial)[0]  # (1, 4, hidden)
-    attention = InklingAttnMegakernel(config, (w,))
-    mlp = InklingMlpMegakernel(config, (w,))
+    runner = InklingVisitMegakernel(config, (w,))
     cache = random_cache(config, visits=2, max_len=1152, seed=layer)
     full = config.is_full(layer)
     for case, pos in enumerate(positions):
         positions_ = torch.tensor([pos], device="cuda")
         h, states = random_inputs(config, blocks, seed=100 * layer + case)
         args = gates.layer(0)
-        errors = check_attention(
-            attention, config, w, layer, 1, h, states, cache, positions_, messages, args
-        )
+        errors, out_errors, residual = check_visit(
+            runner, config, w, layer, 1, h, states, cache, positions_, messages, args,
+            mlp_max_changed=MLP_MAX_CHANGED,
+        )  # fmt: skip
         streams = ref.block_residual(w.attn_query, states, h)[0]
         streams = streams if full else streams.expand(3, -1)
-        flips = check_gates(config, attention.launches[full, True], w, 0, streams, messages, args)
-        print(f"layer {layer} pos {pos} attention: max {errors.max():.2f} "
-              f"median {errors.median():.2f} ulps, {flips} h flips")  # fmt: skip
-        residual, mlp_blocks = ref.attention_block(
-            config, w, layer, 1, h, states, messages, clone(cache), positions_, None, ref.REFERENCE
-        )
-        errors = check_mlp(
-            mlp, config, w, 1, residual, mlp_blocks, cache, positions_, messages[:, 3], args,
-            max_changed=MLP_MAX_CHANGED,
-        )  # fmt: skip
-        stream = ref.block_residual(w.mlp_query[None], mlp_blocks, residual)[0]
-        flips = check_gates(config, mlp.launches[True], w, 3, stream, messages, args)
-        print(f"layer {layer} pos {pos} MLP: max {errors.max():.2f} ulps, "
-              f"{(errors > 0).float().mean():.3f} changed, {flips} h flips")  # fmt: skip
+        mlp_blocks = states + ([h] if layer % config.block_layers == 0 else [])
+        mlp_stream = ref.block_residual(w.mlp_query[None], mlp_blocks, residual)[0]
+        streams = torch.cat([streams, mlp_stream])
+        flips = check_gates(config, runner.launch_of(layer, True), w, streams, messages, args)
+        print(f"layer {layer} pos {pos}: attention max {errors.max():.2f} median "
+              f"{errors.median():.2f} ulps, MLP max {out_errors.max():.2f} ulps, "
+              f"{(out_errors > 0).float().mean():.3f} changed, h flips {flips}")  # fmt: skip
 
 
 @torch.no_grad()
@@ -207,24 +191,21 @@ def test_message_visit_graph_replay_and_compile_reuse():
     queries, block, partial = random_pass(config, 1, seed=3)
     gates = MessageGates((w,), queries)
     msg = InklingMsgMegakernel(config, gates)
-    attention = InklingAttnMegakernel(config, (w,))
-    mlp = InklingMlpMegakernel(config, (w,))
+    runner = InklingVisitMegakernel(config, (w,))
     cache = random_cache(config, visits=1, max_len=1152, seed=3)
     initial = clone(cache)
     h, states = random_inputs(config, 2, seed=4)
     positions = torch.tensor([1030], device="cuda", dtype=torch.int32)
-    residual = torch.empty(config.hidden_size, device="cuda")
     out = torch.empty(config.hidden_size, device="cuda", dtype=torch.bfloat16)
 
     def visit(cache=cache):
         msg(block, partial)
-        attention(w, layer, 0, h, states, cache, positions, residual, gates.layer(0))
-        mlp(w, residual, states, cache.conv_mlp[0], positions, out, gates.layer(0))
+        runner(w, layer, 0, h, states, cache, positions, out, gates.layer(0))
         return out
 
     visit()
-    counts = [f.cache_info().currsize for f in (compile_msg_kernel, compile_attn_kernel,
-                                                compile_mlp_kernel)]  # fmt: skip
+    compiles = (compile_msg_kernel, compile_visit_kernel)
+    counts = [f.cache_info().currsize for f in compiles]
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -246,7 +227,5 @@ def test_message_visit_graph_replay_and_compile_reuse():
             assert torch.equal(tensor, getattr(expected_cache, name)), (pos, name)
     for blocks in (1, 3):  # block counts are runtime values too
         h, others = random_inputs(config, blocks, seed=blocks)
-        attention(w, layer, 0, h, others, cache, positions, residual, gates.layer(0))
-        mlp(w, residual, others, cache.conv_mlp[0], positions, out, gates.layer(0))
-    assert counts == [f.cache_info().currsize for f in (compile_msg_kernel, compile_attn_kernel,
-                                                        compile_mlp_kernel)]  # fmt: skip
+        runner(w, layer, 0, h, others, cache, positions, out, gates.layer(0))
+    assert counts == [f.cache_info().currsize for f in compiles]
