@@ -1,5 +1,8 @@
 """The Inkling 2 Mini quantized experts: the loader's kernel layout (``quant``) decodes to
-``ref.dequantize_experts`` exactly."""
+``ref.dequantize_experts`` exactly, and the quantized expert GEMV (``quant_gemv``) returns
+bit-identical dot products to the same GEMV on the bf16-dequantized weights and to a torch
+emulation of its fp32 accumulation order, for NVFP4 and MXFP8, in a CUDA graph and with one
+compile across routings."""
 
 import gc
 
@@ -126,3 +129,102 @@ def test_load_quantized_model_memory(checkpoint_layers):
     assert formats == [NVFP4] * 20 + [MXFP8] * 4
     assert all(isinstance(layer.w2, QuantExperts) for layer in weights.layers)
     assert 15 < gigabytes < 24, gigabytes
+
+
+# ------------------------------------------------------------------ GEMV
+
+
+def warp_transpose_reduce(a: torch.Tensor) -> torch.Tensor:
+    """``core.warp_transpose_reduce`` for 4 values: ``a`` (groups, 4, 32 lanes) fp32 ->
+    (groups, 4), the sums in the kernel's shuffle order."""
+    lane = torch.arange(32, device=a.device)
+    hi = (lane & 16) != 0
+    halves = []
+    for j in range(2):
+        send = torch.where(hi, a[:, j], a[:, j + 2])
+        keep = torch.where(hi, a[:, j + 2], a[:, j])
+        halves.append(keep + send[:, lane ^ 16])
+    hi = (lane & 8) != 0
+    send = torch.where(hi, halves[0], halves[1])
+    v = torch.where(hi, halves[1], halves[0]) + send[:, lane ^ 8]
+    for offset in (4, 2, 1):
+        v = v + v[:, lane ^ offset]
+    return v[:, ::8]
+
+
+def reference_gemv(w: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """fp32 dot products of bf16 rows ``w`` (rows, K) with bf16 ``x`` (K padded to 256) in the
+    engine's order: lane l, columns 8l .. 8l + 7 of each subtile, even and odd columns in two
+    accumulators (bf16 products are exact in fp32, so each FMA is one fp32 add), their sum,
+    then the warp transpose-reduce over groups of 4 rows."""
+    rows, k = w.shape
+    subtiles = -(-k // 256)
+    wp = torch.zeros(rows, subtiles * 256, device=w.device)
+    wp[:, :k] = w.float()
+    products = (wp * x.float()[: subtiles * 256]).view(rows, subtiles, 32, 8)
+    acc = torch.zeros(rows, 2, 32, device=w.device)
+    for kt in range(subtiles):
+        for e in range(0, 8, 2):
+            acc = acc + products[:, kt, :, e : e + 2].transpose(1, 2)
+    lanes = acc[:, 0] + acc[:, 1]  # (rows, 32)
+    return warp_transpose_reduce(lanes.view(rows // 4, 4, 32)).reshape(rows)
+
+
+@pytest.fixture(scope="module")
+def routed_inputs():
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    experts = torch.randperm(EXPERTS, generator=gen, device="cuda")[:TOP_K].sort().values.int()
+    x = torch.randn(HIDDEN, generator=gen, device="cuda").bfloat16()
+    act = torch.zeros(TOP_K, 1280, device="cuda", dtype=torch.bfloat16)
+    act[:, :WIDTH] = torch.randn(TOP_K, WIDTH, generator=gen, device="cuda") * 3
+    return experts, x, act
+
+
+@pytest.mark.parametrize("fmt", [NVFP4, MXFP8])
+def test_quant_gemv_bitwise(fmt, routed_inputs):
+    """8 routed experts' gate/up (K 2304) and down (K 1152, 4.5 subtiles) tiles: the quantized
+    kernel equals the bf16 kernel on the dequantized weights and the torch emulation bitwise,
+    across stage shapes; a CUDA graph replay and a new routing reuse one compile."""
+    require_sm100()
+    pytest.importorskip("cutlass.cute")
+    # Imported here: the layout tests above need no CuTeDSL.
+    from attn_gym.warpdrive.examples.inkling_megakernel.quant_gemv import (
+        QuantGemv,
+        compile_quant_gemv,
+    )
+
+    experts, x, act = routed_inputs
+    w13 = QuantExperts.from_checkpoint(*random_checkpoint(fmt, 2 * WIDTH, HIDDEN, seed=11))
+    w2 = QuantExperts.from_checkpoint(*random_checkpoint(fmt, HIDDEN, WIDTH, seed=12))
+    d13, d2 = w13.dequantize(), w2.dequantize()
+    expected = torch.stack(
+        [
+            torch.stack([reference_gemv(d13[e], x) for e in experts.tolist()]),
+            torch.stack([reference_gemv(d2[e], act[s]) for s, e in enumerate(experts.tolist())]),
+        ]
+    )
+    dense = QuantGemv(d13, d2).run(experts, x, act).clone()
+    assert torch.equal(dense, expected)
+    for stage_subtiles in (1, 2, 3):
+        runner = QuantGemv(w13, w2, stage_subtiles=stage_subtiles)
+        out = runner.run(experts, x, act).clone()
+        assert torch.equal(out, expected), (stage_subtiles, (out - expected).abs().max())
+
+    compile_fn = compile_quant_gemv
+    runner.out.zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner.run(experts, x, act)
+    graph.replay()
+    assert torch.equal(runner.out, expected)
+    misses = compile_fn.cache_info().misses
+    other = experts.flip(0).contiguous()  # a different slot order: still one compile
+    out = runner.run(other, x, act)
+    reordered = torch.stack(
+        [
+            torch.stack([reference_gemv(d13[e], x) for e in other.tolist()]),
+            torch.stack([reference_gemv(d2[e], act[s]) for s, e in enumerate(other.tolist())]),
+        ]
+    )
+    assert torch.equal(out, reordered)
+    assert compile_fn.cache_info().misses == misses
