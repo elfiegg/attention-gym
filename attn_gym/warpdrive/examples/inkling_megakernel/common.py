@@ -236,11 +236,11 @@ class GateParams:
 
 class InklingKernel(WarpSpecialized):
     """Device helpers of the Inkling launches. Subclasses set ``hidden``, ``rms_eps``,
-    ``csync`` (the compute warps' barrier) and ``engine``, and define ``scratch_shapes`` (tagged
-    words by buffer) when they publish any; launches with message gates call ``init_messages``
-    and implement ``stream_value``. Their params carry ``xs`` (GEMV inputs), ``red``
-    (``(REDUCTIONS, COMPUTE_WARPS, RED_VALUES)`` fp32), ``mix`` (``(MIX_FLOATS,)`` fp32),
-    ``blocks`` and ``gate`` (``GateParams`` or None)."""
+    ``stages`` (``ring_stages``), ``csync`` (the compute warps' barrier) and ``engine``, and
+    define ``scratch_shapes`` (tagged words by buffer) when they publish any; launches with
+    message gates call ``init_messages`` and implement ``stream_value``. Their params carry
+    ``xs`` (GEMV inputs), ``red`` (``(REDUCTIONS, COMPUTE_WARPS, RED_VALUES)`` fp32), ``mix``
+    (``(MIX_FLOATS,)`` fp32), ``blocks`` and ``gate`` (``GateParams`` or None)."""
 
     messages = False
 

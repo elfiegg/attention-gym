@@ -261,7 +261,6 @@ def load_quantized_inkling_weights(
 ) -> ref.InklingWeights:
     """``ref.load_inkling_weights`` with every layer's ``w13``/``w2`` a ``QuantExperts`` in
     checkpoint row order (bf16 checkpoint experts, if any, are rejected)."""
-
     return ref.load_inkling_weights(path_or_repo, device, experts=QuantExperts.from_checkpoint)
 
 

@@ -761,8 +761,8 @@ def hidden_states(
     """The final normalized bf16 (tokens, hidden) states of ``tokens`` at consecutive
     ``positions``, updating ``cache``. ``start``: the first position on the host for HF's
     attention spans and rounding, or None for static shapes (see ``attention``). ``kernels``:
-    implementations of the short convolution, experts and MLP half (default: this module's, HF's
-    numerics)."""
+    implementations of the short convolution, experts and a visit's halves (``Kernels``;
+    default: this module's, HF's numerics)."""
     config = weights.config
     kernels = kernels or REFERENCE
     h = rms_norm(F.embedding(tokens, weights.embed), weights.embed_norm, config.rms_eps)
