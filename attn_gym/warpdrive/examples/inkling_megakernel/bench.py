@@ -142,7 +142,9 @@ def main(
     if bf16:
         allocated = torch.cuda.memory_allocated()
         models["bf16"] = dense = quant.dequantized_weights(weights)
-        memory["bf16"] = memory["quantized"] + torch.cuda.memory_allocated() - allocated
+        # The bf16 model shares every tensor but the experts with the quantized one.
+        stored = sum(e.nbytes for w in weights.layers for e in (w.w13, w.w2))
+        memory["bf16"] = memory["quantized"] - stored + torch.cuda.memory_allocated() - allocated
 
     kinds = launch_kinds(config)
     graphs = {}
