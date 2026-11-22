@@ -21,20 +21,33 @@ bias, top-k with ties to the lower index, renormalized and scaled weights) is re
 the 128 tagged logits by every consumer that needs it: the load warp for the experts' TMA
 coordinates, compute warp 0 for the reducer's weights.
 
-The expert GEMVs are one swappable piece: ``load_expert`` streams an expert row's weight
-stages and ``expert_tile`` consumes them into the GATEUP/DOWN epilogues. Here they are bf16:
-gate and up rows come interleaved from a strided TMA view of the layer's ``(experts, 2 *
-width, hidden)`` weights (no repacked copy); the down projection's 1152 columns are five
-256-column stages: TMA zero-fills the last stage's upper half, and the activation buffer's
-padding is zeroed.
+The expert GEMVs (``load_expert`` streams an expert row's stages, ``expert_tile`` consumes
+them into the GATEUP/DOWN epilogues) read the experts in the format chosen at construction
+(``experts_format``), with the same dot products bit for bit (``quant_gemv``):
+
+- ``"bf16"``: gate and up rows come interleaved from a strided TMA view of the layer's
+  ``(experts, 2 * width, hidden)`` weights (no repacked copy); the down projection's 1152
+  columns are five 256-column stages: TMA zero-fills the last stage's upper half, and the
+  activation buffer's padding is zeroed.
+- ``"nvfp4"``/``"mxfp8"``: the checkpoint's experts as ``quant.QuantExperts`` (checkpoint row
+  order: a 32-row gate/up tile is 16 (gate, up) pairs, as the bf16 view's). A weight stage is
+  the ring's 16 KB slot holding 32 rows x 128 words: 4 subtiles of NVFP4, 2 of MXFP8 (a row's
+  words past its end are TMA zero fill). Each expert row first takes a stage of the ``meta``
+  ring: the row tile's scales of every subtile (the down rows' 5 subtiles in a 9-subtile box,
+  zero filled) and, NVFP4, the expert's magnitude planes ``lut[expert]`` (4 KB). Every
+  ``meta`` stage thus has the same byte count, and with two stages the next row's planes and
+  scales arrive while the compute warps, holding the current row's stage, consume its weight
+  stages.
 """
 
 import math
 
 import cutlass
-from cutlass import BFloat16, Float32, Int32, cute
+from cutlass import BFloat16, Float32, Int32, Int64, cute
 from cutlass.cute.nvgpu import cpasync
 
+from attn_gym.warpdrive.cache import make_fake_compact_tensor
+from attn_gym.warpdrive.examples.inkling_megakernel import quant
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     BACKOFF_NS,
     RING,
@@ -42,17 +55,32 @@ from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     fp32_reciprocal,
     load_tiles,
 )
+from attn_gym.warpdrive.examples.inkling_megakernel.quant_gemv import (
+    BF16,
+    BLOCKS,
+    FORMATS,
+    LANE_WORDS,
+    SUBTILE_WORDS,
+    accumulate_subtile,
+)
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     COMPUTE_THREADS,
+    EVICT_FIRST,
     ROWS,
+    ROWS_PER_WARP,
+    STAGE_BYTES,
     TILE_K,
     bf16_round,
     fetch,
     group_sum,
     publish,
+    warp_transpose_reduce,
 )
 
 ROUTER, GATEUP, DOWN = 3, 4, 5  # after the attention half's ops 0-2
+STAGE_WORDS = STAGE_BYTES // (4 * ROWS)  # Int32 words per row of a quantized weight stage
+META_STAGES = 2
+PLANE_ROWS = 16  # an expert's planes (1024 words) as a (16, 64) TMA box
 
 
 class MlpHalf:
@@ -60,7 +88,8 @@ class MlpHalf:
     ``InklingKernel``'s: ``tma_mlp``/``gmem_mlp`` (router, gate/up, down), ``sW``, ``route``
     (``(2, 2 * top_k)`` fp32: slot s's expert at s, its weight at top_k + s; row 0 for the load
     warp, row 1 for compute warp 0), the tagged ``logits``, ``act``, ``down`` and ``resid``
-    (the attention half's residual) and the argument tensors of ``visit_kernel.VisitParams``."""
+    (the attention half's residual) and the argument tensors of ``visit_kernel.VisitParams``;
+    quantized, the stage views ``sQW`` (weights), ``sS`` (scales) and ``sP`` (NVFP4 planes)."""
 
     def init_mlp(
         self,
@@ -70,9 +99,13 @@ class MlpHalf:
         gate_softcap: float,
         up_softcap: float,
         route_scale: float,
+        experts_format: str,
     ):
-        """Model sizes and constants of the MLP rows (``self.hidden`` set before)."""
+        """Model sizes and constants of the MLP rows (``self.hidden`` set before) and the
+        experts' format (``quant_gemv.FORMATS``)."""
         hidden = self.hidden
+        if experts_format not in FORMATS:
+            raise ValueError(f"experts format must be one of {FORMATS}, got {experts_format!r}")
         if width % (ROWS // 2) or width % 8 or math.ceil(width / TILE_K) * TILE_K > hidden:
             raise ValueError(f"expert width {width}: need a multiple of 16 that fits {hidden}")
         if experts % 32 or experts % ROWS or not 1 <= top_k <= 32:
@@ -85,6 +118,18 @@ class MlpHalf:
         self.down_k_tiles = -(-width // TILE_K)  # the last stage's columns past width are zero
         self.gate_tiles = width // (ROWS // 2)  # gate/up tiles per slot: 16 (gate, up) pairs
         self.row_tiles = hidden // ROWS  # down tiles per slot
+        self.experts_format = experts_format
+        self.quantized = experts_format != BF16
+        # Each kind's (GATEUP, DOWN) 256-column subtiles, and weight stages of stage_subtiles.
+        self.expert_subtiles = (self.hidden_k_tiles, self.down_k_tiles)
+        self.stage_subtiles = STAGE_WORDS // SUBTILE_WORDS[experts_format]
+        self.expert_stages = tuple(-(-n // self.stage_subtiles) for n in self.expert_subtiles)
+        # A ``meta`` stage: tile-major scale words of meta_subtiles subtiles (as many as the
+        # gate/up rows have) and the expert's plane words (NVFP4).
+        self.meta_subtiles = self.hidden_k_tiles
+        self.scale_words = 8 * BLOCKS[experts_format] if self.quantized else 0
+        self.plane_words = 1024 if experts_format == quant.NVFP4 else 0
+        self.meta_stage_bytes = 4 * (self.meta_subtiles * self.scale_words + self.plane_words)
 
     def mlp_scratch_shapes(self) -> dict[str, int]:
         """Tagged int64 words of each MLP intermediate."""
@@ -97,10 +142,10 @@ class MlpHalf:
     # ------------------------------------------------------------------ rows
 
     @cute.jit
-    def load_mlp(self, p, w, op, a, b, routed, lane, epoch):
+    def load_mlp(self, p, w, meta, op, a, b, routed, lane, epoch):
         """The load warp's stages of MLP row ``(op, a, b)``. The expert rows follow the
         routing: the first one waits for the router's logits (``routed`` then 1). Returns the
-        weight ring's producer and ``routed``."""
+        weight and ``meta`` rings' producers and ``routed``."""
         if op == ROUTER:
             w = load_tiles(w, p.tma_mlp[0], p.gmem_mlp[0], a, 0, self.hidden_k_tiles, "W")
         else:
@@ -108,26 +153,48 @@ class MlpHalf:
                 with self.trace_region("route"):
                     self.route(p, lane, epoch, 0)
                 routed = Int32(1)
-            w = self.load_expert(p, w, op, a, Int32(p.route[0, b]))
-        return w, routed
+            w, meta = self.load_expert(p, w, meta, op, a, Int32(p.route[0, b]))
+        return w, meta, routed
 
     @cute.jit
-    def load_expert(self, p, w, op, a, expert):
-        """The weight stages of GATEUP tile ``a`` or DOWN row tile ``a`` of ``expert``."""
-        if op == GATEUP:
-            tile = expert * self.gate_tiles + a
-            w = load_tiles(w, p.tma_mlp[1], p.gmem_mlp[1], tile, 0, self.hidden_k_tiles, "W")
-        else:
-            tile = expert * self.row_tiles + a
-            w = load_tiles(w, p.tma_mlp[2], p.gmem_mlp[2], tile, 0, self.down_k_tiles, "W")
-        return w
+    def load_expert(self, p, w, meta, op, a, expert):
+        """The stages of GATEUP tile ``a`` or DOWN row tile ``a`` of ``expert``: quantized, its
+        ``meta`` stage, then the weight stages. ``tma_mlp``: router, gate/up and down weights,
+        then (quantized) their scales and (NVFP4) planes."""
+        for kind in cutlass.range_constexpr(2):
+            if op == (GATEUP, DOWN)[kind]:
+                tile = expert * (self.gate_tiles, self.row_tiles)[kind] + a
+                buffer = "W"
+                if cutlass.const_expr(self.quantized):
+                    buffer = "QW"
+                    with meta.produce() as h:
+                        cute.copy(
+                            p.tma_mlp[3 + kind],
+                            p.gmem_mlp[3 + kind][None, tile, 0, 0],
+                            h.view("S"),
+                            tma_bar_ptr=h.barrier,
+                            cache_policy=Int64(EVICT_FIRST),
+                        )
+                        if cutlass.const_expr(self.plane_words):
+                            # Other CTAs read the expert's planes too: default L2 policy.
+                            cute.copy(
+                                p.tma_mlp[5 + kind],
+                                p.gmem_mlp[5 + kind][None, expert, 0],
+                                h.view("P"),
+                                tma_bar_ptr=h.barrier,
+                            )
+                w = load_tiles(
+                    w, p.tma_mlp[1 + kind], p.gmem_mlp[1 + kind], tile, 0,
+                    self.expert_stages[kind], buffer,
+                )  # fmt: skip
+        return w, meta
 
     @cute.jit
-    def mlp_row(self, p, w, op, a, b, held, abuf, routed, epoch, tid, warp, lane):
+    def mlp_row(self, p, w, meta, op, a, b, held, abuf, routed, epoch, tid, warp, lane):
         """The compute warps' part of MLP row ``(op, a, b)``. DOWN rows read their slot's
         activations from xs row ``abuf`` (1 or 2), fetched when the slot changes from
-        ``held``; the reducer's routing is computed once (``routed``). Returns the weight
-        ring's consumer, ``held``, ``abuf`` and ``routed``."""
+        ``held``; the reducer's routing is computed once (``routed``). Returns the weight and
+        ``meta`` rings' consumers, ``held``, ``abuf`` and ``routed``."""
         if op == ROUTER:
             vals, row, chans = self.engine.tile(p, (w,), (), 0, self.hidden_k_tiles, warp, lane)
             w = chans[0]
@@ -141,28 +208,66 @@ class MlpHalf:
                 held = b
                 self.fetch_act(p, b, abuf, epoch, tid)
                 self.csync.sync()
-            w = self.expert_tile(p, w, op, a, b, abuf, epoch, warp, lane)
+            w, meta = self.expert_tile(p, w, meta, op, a, b, abuf, epoch, warp, lane)
             if (op == DOWN) & (b == self.top_k - 1) & (warp == 0):
                 if routed == 0:
                     self.route(p, lane, epoch, 1)
                     routed = Int32(1)
                 self.reduce_experts(p, a * ROWS + lane, epoch)
-        return w, held, abuf, routed
+        return w, meta, held, abuf, routed
 
     @cute.jit
-    def expert_tile(self, p, w, op, a, b, abuf, epoch, warp, lane):
+    def expert_tile(self, p, w, meta, op, a, b, abuf, epoch, warp, lane):
         """GATEUP tile ``a`` of slot ``b`` against the MLP input ``xs[0]``, or DOWN row tile
         ``a`` of slot ``b`` against its activations ``xs[abuf]``, then the epilogue."""
-        # Constant stage counts, so the engine's k loop unrolls fully.
-        if op == DOWN:
-            vals, row, chans = self.engine.tile(p, (w,), (), abuf, self.down_k_tiles, warp, lane)
-            w = chans[0]
-            self.epilogue(p, op, a, b, vals[0], row, epoch, warp, lane)
-        else:
-            vals, row, chans = self.engine.tile(p, (w,), (), 0, self.hidden_k_tiles, warp, lane)
-            w = chans[0]
-            self.epilogue(p, op, a, b, vals[0], row, epoch, warp, lane)
-        return w
+        # Constant stage counts, so the k loops unroll fully.
+        for kind in cutlass.range_constexpr(2):
+            if op == (GATEUP, DOWN)[kind]:
+                xbuf = (0, abuf)[kind]
+                if cutlass.const_expr(self.quantized):
+                    with meta.consume() as h:
+                        v, row, w = self.quant_tile(p, w, h, kind, xbuf, warp, lane)
+                    self.epilogue(p, op, a, b, v, row, epoch, warp, lane)
+                else:
+                    k_tiles = self.expert_subtiles[kind]
+                    vals, row, chans = self.engine.tile(p, (w,), (), xbuf, k_tiles, warp, lane)
+                    w = chans[0]
+                    self.epilogue(p, op, a, b, vals[0], row, epoch, warp, lane)
+        return w, meta
+
+    @cute.jit
+    def quant_tile(self, p, w, meta_stage, kind: cutlass.Constexpr, xbuf, warp, lane):
+        """``CudaCoreGemv.tile`` of a quantized expert row tile of ``kind`` (GATEUP 0, DOWN 1)
+        against ``xs[xbuf]``, given the row's ``meta`` stage: the same fp32 operations in the
+        same order on the decoded weights, so the same ``(value, row, w)`` bit for bit as the
+        bf16 engine on the dequantized weights."""
+        fmt = self.experts_format
+        blocks = BLOCKS[fmt]
+        scales = meta_stage.view("S")
+        planes = None
+        if cutlass.const_expr(self.plane_words):
+            plane_stage = meta_stage.view("P")
+            planes = cute.make_tensor(plane_stage.iterator, cute.make_layout(self.plane_words))
+        xwords = cute.recast_tensor(p.xs[xbuf, None], Int32)
+        acc = cute.make_rmem_tensor((ROWS_PER_WARP, 2), Float32)
+        acc.fill(0.0)
+        for st in cutlass.range_constexpr(self.expert_stages[kind]):
+            with w.consume() as h:
+                stage = h.view("QW")
+                for j in cutlass.range_constexpr(self.stage_subtiles):
+                    kt = st * self.stage_subtiles + j
+                    if cutlass.const_expr(kt < self.expert_subtiles[kind]):
+                        xw = cute.make_rmem_tensor((4,), Int32)
+                        cute.autovec_copy(cute.local_tile(xwords, (4,), (kt * 32 + lane,)), xw)
+                        word = scales[0, kt, warp * blocks + lane // (32 // blocks)]
+                        acc = accumulate_subtile(
+                            fmt, acc, stage, warp * ROWS_PER_WARP, j * SUBTILE_WORDS[fmt], xw,
+                            word, planes, 0, lane,
+                        )  # fmt: skip
+        for r in cutlass.range_constexpr(ROWS_PER_WARP):
+            acc[r, 0] = acc[r, 0] + acc[r, 1]
+        v = warp_transpose_reduce(acc[None, 0], lane, ROWS_PER_WARP)
+        return v, warp * ROWS_PER_WARP + lane // (32 // ROWS_PER_WARP), w
 
     # ------------------------------------------------------------ compute helpers
 
@@ -289,20 +394,63 @@ class MlpHalf:
 
     # ------------------------------------------------------------- TMA atoms
 
+    def mlp_targets(self) -> list[tuple[str, tuple[int, ...]]]:
+        """The SMEM buffer and box of each of ``mlp_atoms``' atoms, in order."""
+        if not self.quantized:
+            return [("W", (ROWS, TILE_K))] * 3
+        targets = [("W", (ROWS, TILE_K))] + [("QW", (ROWS, STAGE_WORDS))] * 2
+        targets += [("S", (1, self.meta_subtiles, self.scale_words))] * 2
+        if self.plane_words:
+            targets += [("P", (PLANE_ROWS, self.plane_words // PLANE_ROWS))] * 2
+        return targets
+
     @cute.jit
-    def mlp_atoms(self, router, w13, w2):
-        """TMA ``(atom, tensor)`` pairs of 32 x 256 bf16 tiles of the router, the gate/up rows
-        as ``((gate | up), row, expert)`` (a tile holds 16 (gate, up) pairs, interleaved like
-        ``qwen_megakernel``'s packed weights) and the down rows."""
+    def mlp_atoms(self, router, w13, w2, s13, s2, lut13, lut2):
+        """TMA ``(atom, tensor)`` pairs of the router's 32 x 256 bf16 tiles, then of the
+        experts (``fake_expert_args``), boxed as ``mlp_targets``. bf16: the gate/up rows as
+        ``((gate | up), row, expert)`` (a tile holds 16 (gate, up) pairs, interleaved like
+        ``qwen_megakernel``'s packed weights) and the down rows. Quantized: weight stages of the
+        gate/up and down rows, each row tile's scales and (NVFP4) each expert's planes."""
         h, width, e = self.hidden, self.width, self.experts
-        gate_up = cute.make_tensor(
-            w13.iterator,
-            cute.make_layout(((2, width, e), h), stride=((width * h, h, 2 * width * h), 1)),
-        )
-        down = cute.make_tensor(w2.iterator, cute.make_layout((e * h, width), stride=(width, 1)))
+        sources = [router, w13, w2, s13, s2, lut13, lut2]
+        if cutlass.const_expr(not self.quantized):
+            layout = cute.make_layout(
+                ((2, width, e), h), stride=((width * h, h, 2 * width * h), 1)
+            )
+            sources[1] = cute.make_tensor(w13.iterator, layout)
+            layout = cute.make_layout((e * h, width), stride=(width, 1))
+            sources[2] = cute.make_tensor(w2.iterator, layout)
         op = cpasync.CopyBulkTensorTileG2SOp()
-        smem = cute.make_layout((ROWS, TILE_K), stride=(TILE_K, 1))
+        atoms = []
+        for src, (_, box) in zip(sources, self.mlp_targets()):
+            stride = tuple(math.prod(box[i + 1 :]) for i in range(len(box)))  # row-major
+            smem = cute.make_layout(box, stride=stride)
+            atoms.append(cpasync.make_tiled_tma_atom(op, src, smem, box))
+        return atoms
+
+
+def fake_expert_args(op: MlpHalf) -> list:
+    """Fake compile arguments of a layer's experts in ``op``'s format: ``w13``, ``w2``,
+    their scales and their planes. bf16: ``(experts, 2 * width, hidden)`` gate rows then up
+    rows and ``(experts, hidden, width)``, then placeholders. Quantized
+    (``quant.QuantExperts``, checkpoint row order): the weights as Int32 words ``(experts *
+    rows, columns / 8 | 4)``, the tile-major scales as Int32 ``(experts * rows / 32,
+    subtiles, scale_words)`` and (NVFP4; else placeholders) the planes ``(experts * 16,
+    64)``."""
+    i32, e, h, width = Int32, op.experts, op.hidden, op.width
+    if not op.quantized:
         return [
-            cpasync.make_tiled_tma_atom(op, src, smem, (ROWS, TILE_K))
-            for src in (router, gate_up, down)
+            make_fake_compact_tensor(BFloat16, (e, 2 * width, h)),
+            make_fake_compact_tensor(BFloat16, (e, h, width)),
+            *(make_fake_compact_tensor(i32, (1, 1, 4)) for _ in range(2)),
+            *(make_fake_compact_tensor(i32, (1, 4)) for _ in range(2)),
         ]
+    per_word = 8 // LANE_WORDS[op.experts_format]  # columns per word
+    planes = (e * PLANE_ROWS, op.plane_words // PLANE_ROWS) if op.plane_words else (1, 4)
+    return [
+        make_fake_compact_tensor(i32, (e * 2 * width, h // per_word)),
+        make_fake_compact_tensor(i32, (e * h, width // per_word)),
+        make_fake_compact_tensor(i32, (e * op.gate_tiles, op.hidden_k_tiles, op.scale_words)),
+        make_fake_compact_tensor(i32, (e * op.row_tiles, op.down_k_tiles, op.scale_words)),
+        *(make_fake_compact_tensor(i32, planes) for _ in range(2)),
+    ]

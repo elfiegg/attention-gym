@@ -174,7 +174,7 @@ def test_message_visit_random_weights(layer, blocks, positions):
         mlp_blocks = states + ([h] if layer % config.block_layers == 0 else [])
         mlp_stream = ref.block_residual(w.mlp_query[None], mlp_blocks, residual)[0]
         streams = torch.cat([streams, mlp_stream])
-        flips = check_gates(config, runner.launch_of(layer, True), w, streams, messages, args)
+        flips = check_gates(config, runner.launch_of(w, layer, True), w, streams, messages, args)
         print(f"layer {layer} pos {pos}: attention max {errors.max():.2f} median "
               f"{errors.median():.2f} ulps, MLP max {out_errors.max():.2f} ulps, "
               f"{(out_errors > 0).float().mean():.3f} changed, h flips {flips}")  # fmt: skip

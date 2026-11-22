@@ -31,7 +31,11 @@ earliest unfinished row always has its producers finished (the MLP prologue's pr
 attention rows, which precede every MLP row of every CTA). The last CTA to finish advances the
 epoch, so one runner's launches may follow each other in a stream or a CUDA graph.
 
-``full`` (sliding or full attention) and ``messages`` are constructor choices: 4 compiles.
+Quantized experts add a second ring, ``meta`` (load warp -> compute warps), for each expert
+row's scales and planes (``mlp_half``); ``InklingQuantVisitKernel``'s roles take its ends.
+
+``full`` (sliding or full attention), ``messages`` and ``experts_format`` are constructor
+choices: 4 compiles per format (``visit_kernel_class`` picks the class of a format).
 """
 
 from dataclasses import dataclass
@@ -89,7 +93,15 @@ from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     fetch_uniform,
     gate_atoms,
 )
-from attn_gym.warpdrive.examples.inkling_megakernel.mlp_half import ROUTER, MlpHalf
+from attn_gym.warpdrive.examples.inkling_megakernel.mlp_half import (
+    META_STAGES,
+    PLANE_ROWS,
+    ROUTER,
+    STAGE_WORDS,
+    MlpHalf,
+    fake_expert_args,
+)
+from attn_gym.warpdrive.examples.inkling_megakernel.quant_gemv import BF16
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     BLOCK,
     COMPUTE_THREADS,
@@ -127,6 +139,9 @@ class VisitParams:
     gmem_mlp: tuple
     sW: StageView  # weight stage partition
     sKV: StageView  # KV stage partition
+    sQW: StageView | None  # quantized expert weight stage partition
+    sS: StageView | None  # ``meta`` stage partitions: scales, NVFP4 planes
+    sP: StageView | None
     xs: cute.Tensor  # (x_rows, hidden) bf16 GEMV inputs (see ``InklingVisitKernel.x_rows``)
     red: cute.Tensor  # (REDUCTIONS, COMPUTE_WARPS, RED_VALUES) fp32 prologue reductions
     mix: cute.Tensor  # (MIX_FLOATS,) fp32 the last prologue's block-residual weights (messages)
@@ -183,7 +198,10 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
     """One decode visit (see the module docstring). Constructor arguments are the model sizes
     and constants the kernel reads (``AttentionHalf.init_attention``, ``MlpHalf.init_mlp``);
     ``messages``: a core visit after the first pass, whose q, k, v and MLP inputs pass through
-    message gates; ``stages``: weight ring depth in 16 KB stages."""
+    message gates; ``experts_format``: the experts' format (``mlp_half``); ``stages``: weight
+    ring depth in 16 KB stages."""
+
+    quantized_roles = False  # whether the roles take the ``meta`` ring
 
     def __init__(
         self,
@@ -209,6 +227,7 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
         log_alpha: float = 0.0,
         log_floor: int = 0,
         messages: bool = False,
+        experts_format: str = BF16,
         stages: int | None = None,
     ):
         if hidden % COMPUTE_THREADS or hidden % TILE_K:
@@ -222,12 +241,17 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
             q_heads, kv_heads, d_rel, rel_width, extent, qk_clip, rel_clip, splits, full,
             window, log_alpha, log_floor,
         )  # fmt: skip
-        self.init_mlp(width, experts, top_k, gate_softcap, up_softcap, route_scale)
+        self.init_mlp(width, experts, top_k, gate_softcap, up_softcap, route_scale, experts_format)
+        if self.quantized != self.quantized_roles:
+            raise ValueError(
+                f"{experts_format} experts need visit_kernel_class({experts_format!r})"
+            )
         fixed = (
             2 * self.x_rows * hidden
             + 4 * (REDUCTIONS * COMPUTE_WARPS * RED_VALUES + MIX_FLOATS + QKVS_FLOATS)
             + 4 * (COMPUTE_WARPS + 1) * (HEAD_DIM + 2)
             + 4 * 4 * top_k
+            + (META_STAGES * self.meta_stage_bytes if self.quantized else 0)
             + SMEM_HEADROOM
         )
         fit = (SMEM_BYTES - fixed) // STAGE_BYTES
@@ -238,6 +262,9 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
         self.smem_plan = SmemPlan()
         w = self.smem_plan.buffer("W", BFloat16, align=1024)
         kv = self.smem_plan.buffer("KV", BFloat16, align=1024, overlaps=w)
+        stage_buffers = {"W": w, "KV": kv}
+        if self.quantized:
+            stage_buffers["QW"] = self.smem_plan.buffer("QW", Int32, align=1024, overlaps=w)
         self.smem_plan.buffer("X", BFloat16, align=16)
         self.smem_plan.buffer("RED", Float32, align=16)
         self.smem_plan.buffer("MIX", Float32, align=16)
@@ -246,9 +273,15 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
         # The load warp writes its routing while the compute warps may still run attention
         # rows: ROUTE overlaps nothing.
         self.smem_plan.buffer("ROUTE", Float32, align=16)
+        if self.quantized:
+            meta = {"S": self.smem_plan.buffer("S", Int32, align=128)}
+            if self.plane_words:
+                meta["P"] = self.smem_plan.buffer("P", Int32, align=128)
         # Compute reads stages with generic loads before TMA refills them; the layer emits the
         # fence.proxy.async on a Warps release of a Tma-filled ring.
-        self.w = Ring(stages, Tma(STAGE_BYTES), Warps, buffer={"W": w, "KV": kv})
+        self.w = Ring(stages, Tma(STAGE_BYTES), Warps, buffer=stage_buffers)
+        if self.quantized:
+            self.meta = Ring(META_STAGES, Tma(self.meta_stage_bytes), Warps, buffer=meta)
         self.csync = NamedBarrier(threads=COMPUTE_THREADS)
         self.engine = CudaCoreGemv()
         self.work = WorkStream(mapping=InstructionTable(words=WORDS), schedule=StaticPersistent())
@@ -269,7 +302,8 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
         kind = ("full" if self.full else f"swa{self.window}") + ("_msg" if self.messages else "")
         return (
             f"warpdrive_inkling_visit_{kind}_h{self.hidden}_q{self.q_heads}kv{self.kv_heads}"
-            f"_kv{self.splits}_i{self.width}_e{self.experts}k{self.top_k}_s{self.stages}"
+            f"_kv{self.splits}_i{self.width}_e{self.experts}k{self.top_k}"
+            f"{'' if self.experts_format == BF16 else '_' + self.experts_format}_s{self.stages}"
             f"{self.trace_key()}"
         )
 
@@ -278,7 +312,27 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
     @role(warps=COMPUTE_WARPS, regs=LOAD_REGS)
     @cute.jit
     def load(self, p: VisitParams, *, w: Producer, work: WorkCursor):
-        w = w.views(W=p.sW, KV=p.sKV)
+        w, _, work = self.load_rows(p, w, None, work)
+        return w, work
+
+    @role(warps=range(COMPUTE_WARPS), regs=COMPUTE_REGS)
+    @cute.jit
+    def compute(self, p: VisitParams, *, w: Consumer, work: WorkCursor, me: Local):
+        w, _, work = self.compute_rows(p, w, None, work, me)
+        return w, work
+
+    @cute.jit
+    def load_rows(self, p: VisitParams, w, meta, work):
+        """The load warp's rows; ``meta``: the ``meta`` ring's producer (quantized experts),
+        else None. Returns the ends."""
+        if cutlass.const_expr(self.quantized):
+            w = w.views(W=p.sW, KV=p.sKV, QW=p.sQW)
+            if cutlass.const_expr(self.plane_words):
+                meta = meta.views(S=p.sS, P=p.sP)
+            else:
+                meta = meta.views(S=p.sS)
+        else:
+            w = w.views(W=p.sW, KV=p.sKV)
         epoch = p.state[0] + 1
         pos = Int32(p.pos[0])
         lane = cute.arch.lane_idx()
@@ -288,16 +342,17 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
             if op < ROUTER:
                 w = self.load_attention(p, w, op, a, b, pos)
             elif op < MSGDOWN:
-                w, routed = self.load_mlp(p, w, op, a, b, routed, lane, epoch)
+                w, meta, routed = self.load_mlp(p, w, meta, op, a, b, routed, lane, epoch)
             if cutlass.const_expr(self.messages):
                 if op >= MSGDOWN:
                     w = self.load_gate_item(p, w, op, a, b)
             work.advance()
-        return w, work
+        return w, meta, work
 
-    @role(warps=range(COMPUTE_WARPS), regs=COMPUTE_REGS)
     @cute.jit
-    def compute(self, p: VisitParams, *, w: Consumer, work: WorkCursor, me: Local):
+    def compute_rows(self, p: VisitParams, w, meta, work, me):
+        """The compute warps' rows; ``meta``: the ``meta`` ring's consumer (quantized experts),
+        else None. Returns the ends."""
         tid, warp, lane = me.tid, me.warp, me.lane
         epoch = p.state[0] + 1
         pos = Int32(p.pos[0])
@@ -324,12 +379,12 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
                     p, w, op, a, b, item, obuf, pos, epoch, tid, warp, lane
                 )
             elif op < MSGDOWN:
-                w, held, abuf, routed = self.mlp_row(
-                    p, w, op, a, b, held, abuf, routed, epoch, tid, warp, lane
+                w, meta, held, abuf, routed = self.mlp_row(
+                    p, w, meta, op, a, b, held, abuf, routed, epoch, tid, warp, lane
                 )
             work.advance()
         self.advance_epoch(p, tid, epoch)
-        return w, work
+        return w, meta, work
 
     # ------------------------------------------------------------ compute helpers
 
@@ -425,6 +480,19 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
             "ATT": cute.make_layout((COMPUTE_WARPS + 1, HEAD_DIM + 2), stride=(HEAD_DIM + 2, 1)),
             "ROUTE": cute.make_layout((2, 2 * self.top_k), stride=(2 * self.top_k, 1)),
         }
+        if cutlass.const_expr(self.quantized):
+            layouts["QW"] = cute.make_layout(
+                (ROWS, STAGE_WORDS, self.stages), stride=(STAGE_WORDS, 1, ROWS * STAGE_WORDS)
+            )
+            layouts["S"] = cute.make_layout(
+                (1, self.meta_subtiles, self.scale_words, META_STAGES),
+                stride=(0, self.scale_words, 1, self.meta_subtiles * self.scale_words),
+            )
+        if cutlass.const_expr(self.plane_words):
+            columns = self.plane_words // PLANE_ROWS
+            layouts["P"] = cute.make_layout(
+                (PLANE_ROWS, columns, META_STAGES), stride=(columns, 1, self.plane_words)
+            )
         self.begin_roles(work=bound, layouts=layouts)
         # Materialize the argument tensors in converged code: a first use inside one role's
         # branch would not dominate the other roles' uses.
@@ -436,25 +504,24 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
             name: cute.make_tensor(scratch.iterator + offsets[name], cute.make_layout((size,)))
             for name, size in self.scratch_shapes.items()
         }
-        sW, sKV = self.buffer("W"), self.buffer("KV")
-        # tma: the attention weights (matrices, wo), the caches, the MLP weights.
+        # tma: the attention weights (matrices, wo), the caches, the MLP's (``mlp_targets``).
         n_attn = len(self.matrices) + 1
-        parts = []
-        for i, (atom, g) in enumerate(zip(tma, gtensors)):
-            is_kv = n_attn <= i < n_attn + 2
-            tile = (BLOCK, HEAD_DIM) if is_kv else (ROWS, TILE_K)
-            smem = sKV if is_kv else sW
-            tiles = cute.local_tile(g, tile, (None, None))
-            parts.append(
-                cpasync.tma_partition(
-                    atom,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(smem, 0, 2),
-                    cute.group_modes(tiles, 0, 2),
-                )
+        targets = [("W", (ROWS, TILE_K))] * n_attn + [("KV", (BLOCK, HEAD_DIM))] * 2
+        targets += self.mlp_targets()
+        parts, views = [], {}
+        for atom, g, (name, box) in zip(tma, gtensors, targets):
+            rank = len(box)
+            tiles = cute.local_tile(g, box, (None,) * rank)
+            part = cpasync.tma_partition(
+                atom,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(self.buffer(name), 0, rank),
+                cute.group_modes(tiles, 0, rank),
             )
-        gate = self.gate_params(sW, gate_tma, gate_g, tagged, tensors)
+            parts.append(part)
+            views.setdefault(name, StageView(part[0], axis=1))
+        gate = self.gate_params(self.buffer("W"), gate_tma, gate_g, tagged, tensors)
         num_blocks, queries, boundary, embed_input = flags
         gmem = tuple(part[1] for part in parts)
         params = VisitParams(
@@ -464,8 +531,11 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
             gmem_kv=gmem[n_attn : n_attn + 2],
             tma_mlp=tuple(tma[n_attn + 2 :]),
             gmem_mlp=gmem[n_attn + 2 :],
-            sW=StageView(parts[0][0], axis=1),
-            sKV=StageView(parts[n_attn][0], axis=1),
+            sW=views["W"],
+            sKV=views["KV"],
+            sQW=views.get("QW"),
+            sS=views.get("S"),
+            sP=views.get("P"),
             xs=self.buffer("X"),
             red=self.buffer("RED"),
             mix=self.buffer("MIX"),
@@ -508,6 +578,10 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
         router: cute.Tensor,
         w13: cute.Tensor,
         w2: cute.Tensor,
+        s13: cute.Tensor,
+        s2: cute.Tensor,
+        lut13: cute.Tensor,
+        lut2: cute.Tensor,
         router_bias: cute.Tensor,
         mlp_query: cute.Tensor,
         post_norm: cute.Tensor,
@@ -545,7 +619,7 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
         by_matrix = {Q: wq, K: wk, V: wv, REL: wrel, KDYN: k_dynamic, VDYN: v_dynamic,
                      GATE: wgate, SINK: wsink}  # fmt: skip
         weights, caches = self.attention_atoms(by_matrix, wo, k_cache, v_cache)
-        pairs = weights + caches + self.mlp_atoms(router, w13, w2)
+        pairs = weights + caches + self.mlp_atoms(router, w13, w2, s13, s2, lut13, lut2)
         gate_pairs = []
         if cutlass.const_expr(self.messages):
             gate_pairs = gate_atoms(gate_down, gate_fg, self.hidden)
@@ -568,14 +642,36 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
         ).launch(**self.launch_config(bound), stream=stream)
 
 
+class InklingQuantVisitKernel(InklingVisitKernel):
+    """``InklingVisitKernel`` whose roles also take the ``meta`` ring of quantized experts
+    (``experts_format`` "nvfp4" or "mxfp8")."""
+
+    quantized_roles = True
+
+    @role(warps=COMPUTE_WARPS, regs=LOAD_REGS)
+    @cute.jit
+    def load(self, p: VisitParams, *, w: Producer, meta: Producer, work: WorkCursor):
+        return self.load_rows(p, w, meta, work)
+
+    @role(warps=range(COMPUTE_WARPS), regs=COMPUTE_REGS)
+    @cute.jit
+    def compute(self, p: VisitParams, *, w: Consumer, meta: Consumer, work: WorkCursor, me: Local):
+        return self.compute_rows(p, w, meta, work, me)
+
+
+def visit_kernel_class(experts_format: str) -> type[InklingVisitKernel]:
+    """The visit kernel class of experts in ``experts_format``."""
+    return InklingVisitKernel if experts_format == BF16 else InklingQuantVisitKernel
+
+
 @jit_cache
 def compile_visit_kernel(op: InklingVisitKernel):
-    """One compile per layer kind serves every visit, layer and position: weights, caches and
-    states are arguments; the position, token, block count, query, boundary and embedding
-    flags and the cache capacity are read at run time."""
+    """One compile per layer kind and experts format serves every visit, layer and position:
+    weights, caches and states are arguments; the position, token, block count, query,
+    boundary and embedding flags and the cache capacity are read at run time."""
     bf16, f32 = BFloat16, Float32
     h, qh, kv_dim = op.hidden, op.q_heads, op.kv_dim
-    width, e = op.width, op.experts
+    e = op.experts
     cache_rows = cute.sym_int(divisibility=BLOCK)
     taps = op.kv_heads * op.conv_kernel
     if op.full:  # static taps (kernel, channel), tap 0 the current token
@@ -605,8 +701,7 @@ def compile_visit_kernel(op: InklingVisitKernel):
         make_fake_compact_tensor(tap_dtype, tap_shape, assumed_align=2),
         make_fake_compact_tensor(f32, (h, op.conv_kernel), assumed_align=4),  # attention conv
         make_fake_compact_tensor(bf16, (e, h)),  # router (bf16-exact copy)
-        make_fake_compact_tensor(bf16, (e, 2 * width, h)),
-        make_fake_compact_tensor(bf16, (e, h, width)),
+        *fake_expert_args(op),
         make_fake_compact_tensor(f32, (e,), assumed_align=4),  # router bias
         make_fake_compact_tensor(f32, (1, h), assumed_align=4),  # MLP query
         make_fake_compact_tensor(bf16, (1, h), assumed_align=2),  # post norm

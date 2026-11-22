@@ -13,6 +13,11 @@ visit's output stays in a per-visit buffer that later block residuals read. Laun
 every input from device memory (token and position too) and sync nothing, so a step is
 CUDA-graph capturable, and every launch kind compiles once for all positions.
 
+The experts stream in each layer's stored format: bf16 tensors, or ``quant.QuantExperts`` as
+``quant.load_quantized_inkling_weights`` keeps them (NVFP4 layers 0-19, MXFP8 20-23 for
+Inkling 2 Mini); the quantized launches decode them in registers to the same dot products,
+bit for bit, as the bf16 launches on ``QuantExperts.dequantize()`` weights.
+
 Numerics follow the oracle with ``start=None``; outputs differ by fp32 summation order (block
 residuals, GEMV accumulation, convolutions, routing weights, message gates) and, in attention,
 by the flash merge (probabilities are not rounded to bf16 before the value sum), which can flip
@@ -43,12 +48,18 @@ from attn_gym.warpdrive.examples.inkling_megakernel.head_kernel import (
     InklingHeadKernel,
     compile_head_kernel,
 )
-from attn_gym.warpdrive.examples.inkling_megakernel.mlp_half import DOWN, GATEUP, ROUTER
+from attn_gym.warpdrive.examples.inkling_megakernel.mlp_half import (
+    DOWN,
+    GATEUP,
+    PLANE_ROWS,
+    ROUTER,
+)
 from attn_gym.warpdrive.examples.inkling_megakernel.msg_kernel import (
     MSG,
     InklingMsgKernel,
     compile_msg_kernel,
 )
+from attn_gym.warpdrive.examples.inkling_megakernel.quant_gemv import BF16
 from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
     InklingCache,
     InklingConfig,
@@ -58,6 +69,7 @@ from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
 from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import (
     InklingVisitKernel,
     compile_visit_kernel,
+    visit_kernel_class,
 )
 from attn_gym.warpdrive.examples.qwen_megakernel.core import ROWS
 
@@ -69,6 +81,7 @@ __all__ = [
     "InklingVisitMegakernel",
     "MessageGates",
     "build_visit_table",
+    "experts_format",
     "tagged_values",
     "visit_kernel_for",
 ]
@@ -82,16 +95,17 @@ def visit_kernel_for(
     config: InklingConfig,
     full: bool,
     messages: bool = False,
+    experts_format: str = BF16,
     splits: int | None = None,
     stages: int | None = None,
 ) -> InklingVisitKernel:
     """The visit kernel for ``config``'s full (``full``) or sliding layers, with message gates
-    (``messages``) or without."""
+    (``messages``) or without, streaming experts in ``experts_format``."""
     if config.conv_kernel > RING or ref.CONV_RING != RING:
         raise ValueError(f"the kernels' convolution rings hold {RING} positions")
     if config.head_dim != HEAD_DIM:
         raise ValueError(f"head dim must be {HEAD_DIM}, got {config.head_dim}")
-    return InklingVisitKernel.get_or_build(
+    return visit_kernel_class(experts_format).get_or_build(
         hidden=config.hidden_size,
         q_heads=config.num_q_heads,
         kv_heads=config.num_kv_heads,
@@ -114,8 +128,35 @@ def visit_kernel_for(
         log_alpha=config.log_scaling_alpha if full else 0.0,
         log_floor=config.log_scaling_floor if full else 0,
         messages=messages,
+        experts_format=experts_format,
         stages=stages,
     )
+
+
+def experts_format(w: LayerWeights) -> str:
+    """The format of ``w``'s experts: ``"bf16"`` tensors or ``quant.QuantExperts``' format."""
+    dense = isinstance(w.w13, torch.Tensor)
+    if dense != isinstance(w.w2, torch.Tensor) or (not dense and w.w13.format != w.w2.format):
+        raise ValueError("w13 and w2 must have the same format")
+    return BF16 if dense else w.w13.format
+
+
+def expert_args(w: LayerWeights) -> tuple[torch.Tensor, ...]:
+    """``w``'s experts as the visit kernel's arguments (``mlp_half.fake_expert_args``): bf16
+    tensors as they are, ``quant.QuantExperts`` as Int32 views of their weights, scales and
+    planes; placeholders for what a format has not."""
+    stub = torch.zeros(4, device=w.wq.device, dtype=torch.int32)
+    if experts_format(w) == BF16:
+        return (w.w13, w.w2) + (stub.view(1, 1, 4),) * 2 + (stub.view(1, 4),) * 2
+    pair = (w.w13, w.w2)
+    weights = tuple(q.weight.view(torch.int32).view(q.experts * q.rows, -1) for q in pair)
+    scales = tuple(
+        q.scale.view(torch.int32).view(q.experts * q.rows // ROWS, q.subtiles, -1) for q in pair
+    )
+    planes = tuple(
+        stub.view(1, 4) if q.lut is None else q.lut.view(q.experts * PLANE_ROWS, -1) for q in pair
+    )
+    return weights + scales + planes
 
 
 def table_of(lists: list[list[list[int]]]) -> torch.Tensor:
@@ -272,6 +313,8 @@ class VisitLayer:
     v_taps: torch.Tensor
     rel_proj: torch.Tensor  # (rel_extent, d_rel) bf16
     router: torch.Tensor  # (experts, hidden) bf16 (``bf16_router``)
+    experts_format: str  # ``experts_format``
+    experts: tuple[torch.Tensor, ...]  # ``expert_args``
 
     @classmethod
     def of(cls, config: InklingConfig, w: LayerWeights) -> "VisitLayer":
@@ -287,6 +330,8 @@ class VisitLayer:
                 v_taps=w.v_static.contiguous(),
                 rel_proj=w.rel_proj.T.contiguous(),
                 router=bf16_router(w.router),
+                experts_format=experts_format(w),
+                experts=expert_args(w),
             )
         query = w.attn_query
         if query is None:
@@ -302,6 +347,8 @@ class VisitLayer:
             v_taps=w.v_conv.contiguous(),
             rel_proj=w.rel_proj.T.contiguous(),
             router=bf16_router(w.router),
+            experts_format=experts_format(w),
+            experts=expert_args(w),
         )
 
 
@@ -315,11 +362,12 @@ class EmbedArgs(NamedTuple):
 
 class InklingVisitMegakernel:
     """Launch state of the visit kernels for ``config`` (per layer kind: sliding or full,
-    without or with message gates) and the kernel-form arguments of ``layers``. Launches of one
-    runner must run one at a time in stream order (each kind's launches share a scratch and an
-    epoch). ``splits``: KV splits per q head of (sliding, full) layers. ``trace``: compile with
+    without or with message gates, and each experts format of ``layers``) and the kernel-form
+    arguments of ``layers``. Launches of one runner must run one at a time in stream order
+    (each kind's launches share a scratch and an epoch). ``splits``: KV splits per q head of
+    (sliding, full) layers. ``trace``: compile with
     ranges for the work items and ``trace_region``s, recorded by ``"globaltimer"`` (into
-    ``launches[full, messages].trace_buffer``) or ``"iket"``."""
+    ``launches[full, messages, experts_format].trace_buffer``) or ``"iket"``."""
 
     def __init__(
         self,
@@ -331,20 +379,21 @@ class InklingVisitMegakernel:
         trace: str | None = None,
     ):
         self.config = config
+        self.args = {id(w): VisitLayer.of(config, w) for w in layers}
+        self.layers = layers  # keeps the ids of ``args`` valid
+        formats = sorted({args.experts_format for args in self.args.values()})
         self.launches = {
-            (full, messages): Launch(
-                visit_kernel_for(config, full, messages, splits[full], stages),
+            (full, messages, fmt): Launch(
+                visit_kernel_for(config, full, messages, fmt, splits[full], stages),
                 build_visit_table,
                 device,
                 trace,
             )
             for full in (False, True)
             for messages in (False, True)
+            for fmt in formats
         }
-        for w in layers:  # the launch streams bf16 experts (quantized ones need quant_gemv)
-            ref.require_dense_experts(w)
-        self.args = {id(w): VisitLayer.of(config, w) for w in layers}
-        self.layers = layers  # keeps the ids of ``args`` valid
+        self.last: Launch | None = None  # the launch state of the last call
         hidden = config.hidden_size
         self.no_gates = GateArgs.placeholder(hidden, device)
         self.no_embed = EmbedArgs(
@@ -353,9 +402,10 @@ class InklingVisitMegakernel:
             torch.zeros(1, device=device, dtype=torch.int64),
         )
 
-    def launch_of(self, layer: int, messages: bool) -> Launch:
-        """The launch state of ``layer``'s kind, with message gates or without."""
-        return self.launches[self.config.is_full(layer), messages]
+    def launch_of(self, w: LayerWeights, layer: int, messages: bool) -> Launch:
+        """The launch state of layer ``layer`` (weights ``w``), with message gates or
+        without."""
+        return self.launches[self.config.is_full(layer), messages, self.args[id(w)].experts_format]
 
     def __call__(
         self,
@@ -377,8 +427,8 @@ class InklingVisitMegakernel:
         ``gates`` holds the layer's message gates (messages 0-2 gate q, k, v, message 3 the MLP
         input). With ``embed`` (layer 0 only), the launch computes ``h`` itself,
         ``ref.hidden_states``' normalized embedding of the token, and stores it into ``h``.
-        Returns the bf16 ``(hidden,)`` visit output (into ``out`` if given); ``residual`` holds
-        the post-attention residual."""
+        Returns the bf16 ``(hidden,)`` visit output (into ``out`` if given); ``residual()``
+        holds the post-attention residual."""
         config, hidden = self.config, self.config.hidden_size
         if cache.max_len % BLOCK:
             raise ValueError(f"the cache capacity must be a multiple of {BLOCK}")
@@ -397,7 +447,8 @@ class InklingVisitMegakernel:
         states += [h] * (MAX_BLOCKS - len(states))  # unread
         if out is None:
             out = torch.empty(hidden, device=h.device, dtype=torch.bfloat16)
-        launch = self.launch_of(layer, gates is not None)
+        launch = self.launch_of(w, layer, gates is not None)
+        self.last = launch
         table, norm, token = embed or self.no_embed
         compile_visit_kernel(launch.op)(
             w.wq,
@@ -420,8 +471,7 @@ class InklingVisitMegakernel:
             args.v_taps,
             w.attn_conv,
             args.router,
-            w.w13,
-            w.w2,
+            *args.experts,
             w.router_bias,
             w.mlp_query[None],
             w.post_norm[None],
@@ -451,18 +501,17 @@ class InklingVisitMegakernel:
         )
         return out
 
-    def residual(self, layer: int, messages: bool = False) -> torch.Tensor:
-        """The fp32 ``(hidden,)`` post-attention residual of the last launch of ``layer``'s
-        kind (with or without message gates), from its tagged words."""
-        return tagged_values(self.launch_of(layer, messages), "resid")
+    def residual(self) -> torch.Tensor:
+        """The fp32 ``(hidden,)`` post-attention residual of the last launch, from its tagged
+        words (valid until a launch of the same kind)."""
+        return tagged_values(self.last, "resid")
 
-    def routed_experts(self, w: LayerWeights, layer: int, messages: bool = False) -> torch.Tensor:
-        """The ``(experts_per_token,)`` experts the last launch of ``layer``'s kind routed to,
-        ascending: the top-k of its published router logits' scores plus ``w``'s correction
-        bias, recomputed here."""
-        launch = self.launch_of(layer, messages)
-        keys = torch.sigmoid(tagged_values(launch, "logits")) + w.router_bias
-        return keys.topk(launch.op.top_k).indices.sort().values
+    def routed_experts(self, w: LayerWeights) -> torch.Tensor:
+        """The ``(experts_per_token,)`` experts the last launch (of layer weights ``w``) routed
+        to, ascending: the top-k of its published router logits' scores plus ``w``'s
+        correction bias, recomputed here."""
+        keys = torch.sigmoid(tagged_values(self.last, "logits")) + w.router_bias
+        return keys.topk(self.last.op.top_k).indices.sort().values
 
 
 def tagged_values(launch: Launch, name: str) -> torch.Tensor:

@@ -9,8 +9,8 @@ Modules:
   ``msg_kernel``: a pass's messages; ``head_kernel``: the final block residual, norm and LM
   head; ``common``: their shared device code;
 - ``quant``: the checkpoint's NVFP4/MXFP8 experts kept quantized in the expert GEMV's layout,
-  and their exact bf16 dequantization; ``quant_gemv``: register decode helpers and a
-  standalone quantized expert GEMV launch (not yet used by the visit kernel);
+  their exact bf16 dequantization and the oracle on such a model; ``quant_gemv``: the register
+  decode the visit kernel's expert GEMVs use on them;
 - ``megakernel``: the host side: the whole decode step as launches (``InklingDecoder``);
 - ``bench``: CUDA-graph timings of each launch kind and of the decode step;
 - ``chat``: the model in the warpdrive chat (``attn_gym.warpdrive.examples.chat``).

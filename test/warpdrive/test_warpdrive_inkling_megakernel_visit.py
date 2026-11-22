@@ -206,7 +206,7 @@ def check_visit(
         config, w, layer, visit, h, blocks, messages, theirs, positions, None, FAST
     )
     out = runner(w, layer, visit, h, blocks, cache, positions, gates=gates)
-    residual = runner.residual(layer, gates is not None)[None]
+    residual = runner.residual()[None]
     boundary = layer % config.block_layers == 0
     attn_out = expected[0] if boundary else expected[0] - h[0].float()
     errors = ulps(residual[0] - expected[0] + attn_out, attn_out)
@@ -237,7 +237,7 @@ def check_visit(
         x = ref.message_gate(w.gates[3], x, message, config.rms_eps)
     x = ref.rms_norm(x, w.post_norm, config.rms_eps).to(torch.bfloat16)
     experts = ref.route(config, w, x)[0][0].sort().values
-    assert torch.equal(runner.routed_experts(w, layer, gates is not None), experts)
+    assert torch.equal(runner.routed_experts(w), experts)
     out_errors = scale_ulps(out, expected[0])
     changed = (out_errors > 0).float().mean()
     assert out_errors.max() <= MLP_ULPS and changed <= mlp_max_changed, out_errors.max()
@@ -320,13 +320,13 @@ def test_graph_replay_and_compile_reuse():
         positions.fill_(pos)
         expected_cache = clone(initial)
         expected = runner(w, 1, 0, h, states, expected_cache, positions).clone()
-        expected_residual = runner.residual(1).clone()
+        expected_residual = runner.residual().clone()
         for name, tensor in vars(cache).items():
             tensor.copy_(getattr(initial, name))
         out.zero_()
         graph.replay()
         assert torch.equal(out, expected), pos
-        assert torch.equal(runner.residual(1), expected_residual), pos
+        assert torch.equal(runner.residual(), expected_residual), pos
         for name, tensor in vars(cache).items():
             assert torch.equal(tensor, getattr(expected_cache, name)), (pos, name)
 
