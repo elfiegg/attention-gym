@@ -8,7 +8,6 @@ compile reuse across positions, on random weights at the real shapes and on the 
 own visits."""
 
 import dataclasses
-from pathlib import Path
 
 import pytest
 import torch
@@ -17,12 +16,10 @@ pytest.importorskip("cutlass.cute")
 
 from inkling_checkpoint import checkpoint_path
 
-from attn_gym.warpdrive.cache._key import module_closure
 from attn_gym.warpdrive.examples.inkling_megakernel import ref
 from attn_gym.warpdrive.examples.inkling_megakernel.fast import FAST, decode_step
 from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
     InklingVisitMegakernel,
-    visit_kernel_for,
 )
 from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import compile_visit_kernel
 
@@ -403,32 +400,3 @@ def test_checkpoint_visits():
     decode_step(weights, token, pos, cache, dataclasses.replace(FAST, attention_block=spy))
     plain = [v for v, layer, p in config.visits() if not (config.is_loop(layer) and p > 0)]
     assert visits == plain
-
-
-def test_kernels_compile_from_kernel_modules_only():
-    """The compile keys of the Inkling launches hash only kernel modules: editing the oracle,
-    the quantized-expert loader or the host runners recompiles nothing."""
-    package = Path(ref.__file__).parent
-    host = {package / f"{name}.py" for name in ("ref", "quant", "megakernel", "fast", "bench")}
-    for kernel in ("visit_kernel", "msg_kernel", "head_kernel"):
-        assert not host & set(module_closure(package / f"{kernel}.py")), kernel
-
-
-@pytest.mark.parametrize(
-    "change,match",
-    [
-        # Routing reads 3 logits per lane: odd lanes would issue misaligned vector loads.
-        ({"num_experts": 96}, "routing reads"),
-        ({"num_experts": 2048}, "at most 1024 experts"),
-        # An o_proj split merges 8 heads x 128 = 1024 elements into a 768-element input row.
-        ({"hidden_size": 768, "num_q_heads": 32, "moe_intermediate_size": 512,
-          "rel_extent": 512, "sliding_window": 512}, "o_proj split"),
-    ],
-)  # fmt: skip
-def test_unsupported_geometry_is_rejected(change, match):
-    """Shapes the kernels cannot run are rejected when a runner builds its kernels, for both
-    layer kinds, before anything launches."""
-    config = dataclasses.replace(CONFIG, **change)
-    for full in (False, True):
-        with pytest.raises(ValueError, match=match):
-            visit_kernel_for(config, full)

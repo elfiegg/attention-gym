@@ -55,15 +55,15 @@ from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     post_conv,
     tma_atom,
 )
-from attn_gym.warpdrive.examples.inkling_megakernel.quant_gemv import (
+from attn_gym.warpdrive.examples.inkling_megakernel.formats import (
     BF16,
     BLOCKS,
     FORMATS,
     LANE_WORDS,
     NVFP4,
     SUBTILE_WORDS,
-    accumulate_subtile,
 )
+from attn_gym.warpdrive.examples.inkling_megakernel.quant_gemv import accumulate_subtile
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     COMPUTE_THREADS,
     EVICT_FIRST,
@@ -103,7 +103,7 @@ class MlpHalf:
         experts_format: str,
     ):
         """Model sizes and constants of the MLP rows (``self.hidden`` set before) and the
-        experts' format (``quant_gemv.FORMATS``)."""
+        experts' format (``formats.FORMATS``)."""
         hidden = self.hidden
         if experts_format not in FORMATS:
             raise ValueError(f"experts format must be one of {FORMATS}, got {experts_format!r}")

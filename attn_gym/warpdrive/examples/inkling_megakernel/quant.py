@@ -42,7 +42,7 @@ from pathlib import Path
 import torch
 
 from attn_gym.warpdrive.examples.inkling_megakernel import ref
-from attn_gym.warpdrive.examples.inkling_megakernel.quant_gemv import (
+from attn_gym.warpdrive.examples.inkling_megakernel.formats import (
     BLOCK_COLUMNS,
     MXFP8,
     NVFP4,

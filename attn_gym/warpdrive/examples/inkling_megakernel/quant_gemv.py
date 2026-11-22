@@ -41,6 +41,13 @@ from cutlass import Float32, Int32, cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from attn_gym.warpdrive.examples.inkling_megakernel.formats import (
+    LANE_WORDS,
+    MXFP8,
+    SUBTILE,
+    TILE_ROWS,
+    WARPS,
+)
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     COMPUTE_WARPS,
     ROWS,
@@ -48,16 +55,8 @@ from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     TILE_K,
 )
 
-# The experts formats and the layout geometry they share with ``quant``, which imports them
-# from here: kernel modules import no host module, so host-side edits recompile nothing.
-BF16, NVFP4, MXFP8 = "bf16", "nvfp4", "mxfp8"
-FORMATS = (BF16, NVFP4, MXFP8)
-TILE_ROWS, SUBTILE, WARPS = ROWS, TILE_K, COMPUTE_WARPS  # a weight tile and its warps
-BLOCK_COLUMNS = {NVFP4: 16, MXFP8: 32}  # columns per scale byte
-LANE_WORDS = {NVFP4: 1, MXFP8: 2}  # weight words per lane, row, subtile
-SUBTILE_WORDS = {f: 32 * w for f, w in LANE_WORDS.items()}
-# Tile-major scale words per subtile: 8 warps x blocks (each word: a block's 4 warp rows).
-BLOCKS = {fmt: TILE_K // columns for fmt, columns in BLOCK_COLUMNS.items()}
+# ``formats`` spells the tile geometry out to stay a leaf the host loader can import.
+assert (TILE_ROWS, SUBTILE, WARPS) == (ROWS, TILE_K, COMPUTE_WARPS)
 
 
 # ------------------------------------------------------------------ register decode

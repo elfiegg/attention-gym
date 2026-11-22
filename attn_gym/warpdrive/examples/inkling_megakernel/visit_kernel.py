@@ -95,6 +95,7 @@ from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     ring_stages,
     tma_partition,
 )
+from attn_gym.warpdrive.examples.inkling_megakernel.formats import BF16
 from attn_gym.warpdrive.examples.inkling_megakernel.mlp_half import (
     META_STAGES,
     PLANE_ROWS,
@@ -103,7 +104,6 @@ from attn_gym.warpdrive.examples.inkling_megakernel.mlp_half import (
     MlpHalf,
     fake_expert_args,
 )
-from attn_gym.warpdrive.examples.inkling_megakernel.quant_gemv import BF16
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     BLOCK,
     COMPUTE_THREADS,

@@ -10,7 +10,8 @@ Modules:
   head; ``common``: their shared device code;
 - ``quant``: the checkpoint's NVFP4/MXFP8 experts kept quantized in the expert GEMV's layout,
   their exact bf16 dequantization and the oracle on such a model; ``quant_gemv``: the register
-  decode the visit kernel's expert GEMVs use on them;
+  decode the visit kernel's expert GEMVs use on them; ``formats``: the formats and tile
+  geometry both share (no imports, so the loader needs no CuTeDSL);
 - ``megakernel``: the host side: the whole decode step as launches (``InklingDecoder``);
 - ``bench``: CUDA-graph timings of each launch kind and of the decode step;
 - ``chat``: the model in the warpdrive chat (``attn_gym.warpdrive.examples.chat``).

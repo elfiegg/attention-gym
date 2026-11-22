@@ -48,6 +48,7 @@ from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     RING,
     WORDS,
 )
+from attn_gym.warpdrive.examples.inkling_megakernel.formats import BF16
 from attn_gym.warpdrive.examples.inkling_megakernel.head_kernel import (
     LMHEAD,
     InklingHeadKernel,
@@ -64,7 +65,6 @@ from attn_gym.warpdrive.examples.inkling_megakernel.msg_kernel import (
     InklingMsgKernel,
     compile_msg_kernel,
 )
-from attn_gym.warpdrive.examples.inkling_megakernel.quant_gemv import BF16
 from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
     InklingCache,
     InklingConfig,
