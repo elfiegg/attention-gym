@@ -5,9 +5,16 @@ post-attention convolution and residual, for sliding and full layers; the cache 
 it writes), its MLP half against ``ref.mlp_block`` on the launch's own post-attention residual
 (routing, block residual, experts, post-MLP convolution and residual), a CUDA graph replay and
 compile reuse across positions, on random weights at the real shapes and on the checkpoint's
-own visits."""
+own visits; the runner's guards (residency, cache capacity, layer kind), the fences the
+bitwise tests cannot see, and a traced launch. Host-only checks are in
+``test_warpdrive_inkling_megakernel_host``."""
 
 import dataclasses
+import re
+import subprocess
+import sys
+import warnings
+from pathlib import Path
 
 import pytest
 import torch
@@ -20,8 +27,10 @@ from attn_gym.warpdrive.examples.inkling_megakernel import ref
 from attn_gym.warpdrive.examples.inkling_megakernel.fast import FAST, decode_step
 from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
     InklingVisitMegakernel,
+    visit_kernel_for,
 )
 from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import compile_visit_kernel
+from attn_gym.warpdrive.ptx_check import capture_ptx, read_ptx
 
 pytestmark = pytest.mark.usefixtures("requires_blackwell", "release_cuda_memory")
 
@@ -346,26 +355,111 @@ def test_graph_replay_and_compile_reuse():
     assert info.hits + info.misses == before.hits + before.misses + 4  # one per eager launch
 
 
-@torch.no_grad()
+# Run in a subprocess, killed after RESIDENCY_TIMEOUT_S: a regression that admitted the oversized
+# grid would spin forever on the CTA that never starts.
+RESIDENCY_PROBE = """
+import sys
+import pytest
+import torch
+from test_warpdrive_inkling_megakernel_visit import (
+    CONFIG, clone, random_cache, random_inputs, random_layer,
+)
+from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
+    InklingVisitMegakernel, build_visit_table,
+)
+
+torch.set_grad_enabled(False)
+w = random_layer(CONFIG, 1, seed=1)
+runner = InklingVisitMegakernel(CONFIG, (w,))
+cache = random_cache(CONFIG, visits=1, max_len=1152, seed=1)
+h, states = random_inputs(CONFIG, 1, seed=2)
+positions = torch.tensor([100], device="cuda")
+expected = runner(w, 1, 0, h, states, clone(cache), positions).clone()
+launch = runner.launch_of(w, 1, False)
+table, ctas = launch.table, launch.max_ctas
+launch.max_ctas = ctas + 1  # one CTA more than SMs, with its rows dealt over all of them
+launch.table = build_visit_table(launch.op, ctas + 1).cuda()
+# cudaErrorCooperativeLaunchTooLarge: a RuntimeError, or the DSL's own error type on the
+# launch right after a compile.
+with pytest.raises(Exception, match="720"):
+    runner(w, 1, 0, h, states, clone(cache), positions)
+    torch.cuda.synchronize()
+launch.table, launch.max_ctas = table, ctas
+assert torch.equal(runner(w, 1, 0, h, states, cache, positions), expected)
+print("ok")
+"""
+RESIDENCY_TIMEOUT_S = 300
+
+
 def test_grid_beyond_residency_is_rejected():
     """The visit launch is cooperative: a grid with more CTAs than can be resident at once (as
     when another kernel or an SM limit leaves fewer SMs) fails at launch instead of spinning
     forever on CTAs that never start, and the runner works again afterwards."""
+    result = subprocess.run(
+        [sys.executable, "-c", RESIDENCY_PROBE],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=RESIDENCY_TIMEOUT_S,
+        cwd=Path(__file__).parent,
+    )
+    assert result.returncode == 0 and result.stdout.strip().endswith("ok"), result.stderr
+
+
+@torch.no_grad()
+def test_position_at_capacity_stores_no_cache_row():
+    """A position at the cache capacity (outside the caller's contract) leaves every K/V cache
+    row unchanged, the next visit's included, instead of writing another head's row."""
     w = random_layer(CONFIG, 1, seed=1)
     runner = InklingVisitMegakernel(CONFIG, (w,))
+    cache = random_cache(CONFIG, visits=2, max_len=1152, seed=1)
+    initial = clone(cache)
+    h, states = random_inputs(CONFIG, 1, seed=2)
+    runner(w, 1, 0, h, states, cache, torch.tensor([cache.max_len], device="cuda"))
+    torch.cuda.synchronize()
+    assert torch.equal(cache.k, initial.k) and torch.equal(cache.v, initial.v)
+
+
+def test_layer_kind_mismatch_is_rejected():
+    """A layer's weights launch only as the kind ``config`` gives that layer, and only weights
+    the runner was built with launch at all."""
+    w = random_layer(CONFIG, 1, seed=1)
+    runner = InklingVisitMegakernel(CONFIG, (w,))
+    assert not CONFIG.is_full(1) and CONFIG.is_full(5)
+    with pytest.raises(ValueError, match="sliding layer's, unlike config's"):
+        runner.launch_of(w, 5, False)
+    with pytest.raises(ValueError, match="one of the layers"):
+        runner.launch_of(random_layer(CONFIG, 1, seed=2), 1, False)
+
+
+def test_split_partials_publish_with_fences(tmp_path):
+    """The cache-row store's release/acquire edge (``attn_half``'s module docstring) is in the
+    PTX: the newest split's proxy and release fences before it publishes (m, l), and the merge's
+    acquire fence before the store. Results cannot show a missing fence; the PTX can."""
+    with capture_ptx(tmp_path) as out:
+        compile_visit_kernel.__wrapped__(visit_kernel_for(CONFIG, full=False))
+    (path,) = out.glob("*.ptx")
+    text = read_ptx(path)
+    assert len(re.findall(r"^\s*fence\.proxy\.async\.global;", text, re.MULTILINE)) == 1
+    assert len(re.findall(r"^\s*fence\.acq_rel\.gpu;", text, re.MULTILINE)) == 2
+
+
+@torch.no_grad()
+def test_traced_launch_records_every_row():
+    """A ``trace="globaltimer"`` runner records a compute range for every row of the launch's
+    table within its trace capacity."""
+    w = random_layer(CONFIG, 1, seed=1)
+    runner = InklingVisitMegakernel(CONFIG, (w,), trace="globaltimer")
     cache = random_cache(CONFIG, visits=1, max_len=1152, seed=1)
     h, states = random_inputs(CONFIG, 1, seed=2)
-    positions = torch.tensor([100], device="cuda")
-    expected = runner(w, 1, 0, h, states, clone(cache), positions).clone()
-    launch = runner.launch_of(w, 1, False)
-    launch.max_ctas += 1
-    # cudaErrorCooperativeLaunchTooLarge: a RuntimeError, or the DSL's own error type on the
-    # launch right after a compile.
-    with pytest.raises(Exception, match="720"):
-        runner(w, 1, 0, h, states, clone(cache), positions)
-        torch.cuda.synchronize()
-    launch.max_ctas -= 1
-    assert torch.equal(runner(w, 1, 0, h, states, cache, positions), expected)
+    positions = torch.tensor([1100], device="cuda")
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message="warpdrive trace")
+        with runner.traced(w, 1) as session:
+            runner(w, 1, 0, h, states, cache, positions)
+    rows = runner.launch_of(w, 1, False).table[:, 0].tolist()
+    traced = {r.payload for r in session.ranges if r.name == "compute"}
+    assert traced >= {i for i, op in enumerate(rows) if op >= 0}
 
 
 @pytest.mark.xdist_group("inkling-checkpoint")
