@@ -5,16 +5,21 @@ bf16 (``--bf16``, the default; also times the torch step ``fast.decode_step`` on
 
     python -m attn_gym.warpdrive.examples.inkling_megakernel.bench --context 1100
 
-The cache is prefilled with ``context`` tokens by the oracle; every timed call decodes at that
-position with the inputs a real megakernel step produced there, rewriting the same cache rows
-(a fixed-position, reused-buffer workload: weights larger than L2 stream from DRAM, the caches
-and activations may stay in L2). A launch graph replays ``reps`` calls of one launch of the
-step back to back and reports the time per call; the breakdown multiplies each kind's time by
-its launches per step, and the rest of the measured step is the gaps between launches, plus
+The cache is prefilled with ``context`` tokens by the oracle (``0 < context < max_len``);
+every timed call decodes at that position with the inputs a real megakernel step produced
+there, rewriting the same cache rows (a fixed-position, reused-buffer workload: weights larger
+than L2 stream from DRAM, the caches and activations may stay in L2). Launch kinds are split
+by attention kind, message gates and experts format; a kind's graph replays ``reps`` calls of
+its first launch of the step back to back (with that launch's own message state, snapshotted
+when the step ran it) and reports the time per call. The breakdown multiplies each kind's time
+by its launches per step; the residual (step minus that sum) holds the gaps between launches,
 whatever a repeated launch gains over its first run inside a step (a layer's ~54 MB of
-attention weights may stay partly in L2 across repeats despite evict-first loads). Graphs
-are timed in ``rounds`` interleaved rounds (rotating order) and each row reports the median of
-the round medians. Default DVFS.
+attention weights may stay partly in L2 across repeats despite evict-first loads) and the
+differences between a kind's launches. Graphs are timed in ``rounds`` interleaved rounds
+(rotating order) and each row reports the median of the round medians. Default DVFS.
+
+Every launch of a visit occupies the whole GPU (a cooperative grid of one CTA per SM): run the
+benchmark alone on its GPU.
 """
 
 import json
@@ -33,7 +38,11 @@ from attn_gym.warpdrive.examples.bench_support import (
 )
 from attn_gym.warpdrive.examples.inkling_megakernel import quant, ref
 from attn_gym.warpdrive.examples.inkling_megakernel.fast import decode_step
-from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import InklingDecoder
+from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
+    GateArgs,
+    InklingDecoder,
+    experts_format,
+)
 
 
 class Captured(NamedTuple):
@@ -75,20 +84,36 @@ def time_graphs(graphs: dict[str, Captured], rounds: int, iters: int) -> dict[st
     return {name: sorted(m)[len(m) // 2] for name, m in medians.items()}
 
 
+def snapshot(value):
+    """``value`` with the message state that later launches of the step overwrite copied: a
+    ``GateArgs``' messages and message halves (``msg_kernel`` rewrites them every pass). The
+    other arguments (weights, per-visit states, caches, position) keep their contents through
+    the step."""
+    if isinstance(value, GateArgs):
+        return value._replace(mhalf=value.mhalf.clone(), messages=value.messages.clone())
+    return value
+
+
 class Recorder:
-    """A runner whose calls also append themselves to ``calls``, ready to replay."""
+    """A runner whose calls also append themselves to ``calls``, ready to replay with the
+    operands they read (``snapshot``)."""
 
     def __init__(self, runner, calls: list):
         self.runner, self.calls = runner, calls
 
     def __call__(self, *args, **kwargs):
-        self.calls.append(partial(self.runner, *args, **kwargs))
+        frozen = [snapshot(a) for a in args]
+        self.calls.append(
+            partial(self.runner, *frozen, **{k: snapshot(v) for k, v in kwargs.items()})
+        )
         return self.runner(*args, **kwargs)
 
 
-def launch_kinds(config: ref.InklingConfig) -> dict[str, tuple[str, int, int]]:
-    """``{kind: (runner, call, launches per step)}``: each launch kind of a step, the runner
-    and the index of the call that represents it (the first of the kind)."""
+def launch_kinds(weights: ref.InklingWeights) -> dict[str, tuple[str, int, int]]:
+    """``{kind: (runner, call, launches per step)}``: each launch kind of a step of
+    ``weights`` (visits by attention kind, message gates and experts format), the runner and
+    the index of the call that represents it (the first of the kind)."""
+    config = weights.config
     kinds = {}
 
     def add(kind, runner, call):
@@ -98,7 +123,8 @@ def launch_kinds(config: ref.InklingConfig) -> dict[str, tuple[str, int, int]]:
     for visit, layer, p in config.visits():
         layer_kind = "full" if config.is_full(layer) else "sliding"
         messages = " + messages" if config.is_loop(layer) and p > 0 else ""
-        add(f"visit{messages}, {layer_kind}", "visit", visit)
+        fmt = experts_format(weights.layers[layer])
+        add(f"visit{messages}, {layer_kind}, {fmt}", "visit", visit)
     for p in range(1, config.num_passes):
         add("messages", "msg", p - 1)
     add("head", "head", 0)
@@ -128,6 +154,8 @@ def main(
     checkpoint: str = "thinkingmachines/Inkling-2-Mini",
     json_out: Annotated[Path | None, typer.Option(help="write results, provenance")] = None,
 ):
+    if not 0 < context < max_len:
+        raise typer.BadParameter(f"need 0 < context < max_len, got {context} and {max_len}")
     torch.cuda.synchronize()
     before = torch.cuda.memory_allocated()
     weights = quant.load_quantized_inkling_weights(checkpoint)
@@ -146,12 +174,12 @@ def main(
         stored = sum(e.nbytes for w in weights.layers for e in (w.w13, w.w2))
         memory["bf16"] = memory["quantized"] - stored + torch.cuda.memory_allocated() - allocated
 
-    kinds = launch_kinds(config)
+    kinds = {name: launch_kinds(model) for name, model in models.items()}
     graphs = {}
     for name, model in models.items():
         decoder = InklingDecoder(model)
         calls = record_calls(decoder, token, pos, cache)
-        for kind, (runner, call, _) in kinds.items():
+        for kind, (runner, call, _) in kinds[name].items():
             graphs[f"{name}: {kind}"] = capture(calls[runner][call], reps)
         graphs[f"decode step: megakernel, {name}"] = capture(
             partial(decoder, token, pos, cache), 1
@@ -165,13 +193,13 @@ def main(
         print(f"{name + ' experts: launch kind':40s} {'us/launch':>10s} {'per step':>9s} "
               f"{'us/step':>9s}")  # fmt: skip
         launches = 0.0
-        for kind, (_, _, count) in kinds.items():
+        for kind, (_, _, count) in kinds[name].items():
             us = results[f"{name}: {kind}"]
             launches += count * us
             print(f"{kind:40s} {us:10.1f} {count:9d} {count * us:9.1f}")
         step = results[f"decode step: megakernel, {name}"]
         print(f"{'launches (sum)':40s} {'':10s} {'':9s} {launches:9.1f}")
-        print(f"{'gaps (step - sum)':40s} {'':10s} {'':9s} {step - launches:9.1f}")
+        print(f"{'residual (step - sum)':40s} {'':10s} {'':9s} {step - launches:9.1f}")
         print(f"{'model weights (GB)':40s} {memory[name] / 1e9:10.1f}")
     for name, us in results.items():
         if name.startswith("decode step"):
