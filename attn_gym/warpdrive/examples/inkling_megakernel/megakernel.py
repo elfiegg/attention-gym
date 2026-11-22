@@ -538,7 +538,9 @@ class InklingVisitMegakernel:
         """The ``(experts_per_token,)`` experts the last launch (which must be of layer weights
         ``w``) routed to, ascending: the top-k of its published router logits' scores plus ``w``'s
         correction bias, recomputed here with the kernel's tie rule (equal keys go to the lower
-        expert index; ``torch.topk`` does not promise an order among ties)."""
+        expert index; ``torch.topk`` does not promise an order among ties). A diagnostic of the
+        published logits, not the IDs the kernel dispatched: each CTA selects those in shared
+        memory and publishes none."""
         keys = torch.sigmoid(tagged_values(self.last, "logits")) + w.router_bias
         order = torch.sort(keys, descending=True, stable=True).indices
         return order[: self.last.op.top_k].sort().values
