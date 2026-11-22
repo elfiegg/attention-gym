@@ -109,14 +109,18 @@ class MlpHalf:
             raise ValueError(f"experts format must be one of {FORMATS}, got {experts_format!r}")
         if width % (ROWS // 2) or width % 8 or math.ceil(width / TILE_K) * TILE_K > hidden:
             raise ValueError(f"expert width {width}: need a multiple of 16 that fits {hidden}")
+        if experts < 1:
+            raise ValueError(f"need at least one expert, got {experts}")
         per_lane = experts // 32  # routing: lane l's logits are one aligned run of words
         if experts % 32 or experts % ROWS or not (per_lane in (1, 2) or per_lane % 4 == 0):
             raise ValueError(
                 f"{experts} experts: routing reads experts / 32 logits per lane, which must be "
                 "1, 2 or a multiple of 4 (64, 128, 256, ... experts)"
             )
-        if per_lane > 32 or not 1 <= top_k <= 32:
-            raise ValueError("need at most 1024 experts and 1 to 32 of them per token")
+        if per_lane > 32 or not 1 <= top_k <= min(experts, 32):
+            raise ValueError(
+                "need at most 1024 experts and 1 to min(experts, 32) of them per token"
+            )
         if (width + 7) // 8 + (TILE_K - width % TILE_K) % TILE_K // 8 > COMPUTE_THREADS:
             raise ValueError("the activation fetch covers at most 8 words per compute thread")
         self.width, self.experts, self.top_k = width, experts, top_k

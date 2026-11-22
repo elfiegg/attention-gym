@@ -48,6 +48,10 @@ def test_kernels_compile_from_kernel_modules_only():
         # Routing reads 3 logits per lane: odd lanes would issue misaligned vector loads.
         ({"num_experts": 96}, "routing reads"),
         ({"num_experts": 2048}, "at most 1024 experts"),
+        # Routing would read the logit of expert 0 of none.
+        ({"num_experts": 0}, "at least one expert"),
+        ({"experts_per_token": 0}, "of them per token"),
+        ({"experts_per_token": 33}, "of them per token"),
         # An o_proj split merges 8 heads x 128 = 1024 elements into a 768-element input row.
         ({"hidden_size": 768, "num_q_heads": 32, "moe_intermediate_size": 512,
           "rel_extent": 512, "sliding_window": 512}, r"hidden-size \(768\) input row"),
