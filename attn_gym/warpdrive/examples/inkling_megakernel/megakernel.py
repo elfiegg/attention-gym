@@ -318,33 +318,25 @@ class VisitLayer:
 
     @classmethod
     def of(cls, config: InklingConfig, w: LayerWeights) -> "VisitLayer":
-        if w.q_norm is not None:  # a full layer
-            norms = torch.stack((w.q_norm, w.k_norm, w.v_norm))
-            return cls(
-                query=w.attn_query.contiguous(),
-                norms=norms,
-                gated_norms=norms,
-                k_dynamic=w.k_dynamic,
-                v_dynamic=w.v_dynamic,
-                k_taps=w.k_static.contiguous(),
-                v_taps=w.v_static.contiguous(),
-                rel_proj=w.rel_proj.T.contiguous(),
-                router=bf16_router(w.router),
-                experts_format=experts_format(w),
-                experts=expert_args(w),
-            )
         query = w.attn_query
-        if query is None:
-            query = torch.zeros(1, config.hidden_size, device=w.wq.device)
-        placeholder = w.wk[: config.num_kv_heads * config.conv_kernel]
+        if w.q_norm is not None:  # a full layer
+            norms = gated_norms = torch.stack((w.q_norm, w.k_norm, w.v_norm))
+            k_dynamic, v_dynamic = w.k_dynamic, w.v_dynamic
+            k_taps, v_taps = w.k_static, w.v_static
+        else:
+            if query is None:
+                query = torch.zeros(1, config.hidden_size, device=w.wq.device)
+            norms, gated_norms = w.input_norm[None], w.input_norm.expand(3, -1)
+            k_dynamic = v_dynamic = w.wk[: config.num_kv_heads * config.conv_kernel]
+            k_taps, v_taps = w.k_conv, w.v_conv
         return cls(
             query=query.contiguous(),
-            norms=w.input_norm[None].contiguous(),
-            gated_norms=w.input_norm.expand(3, -1).contiguous(),
-            k_dynamic=placeholder,
-            v_dynamic=placeholder,
-            k_taps=w.k_conv.contiguous(),
-            v_taps=w.v_conv.contiguous(),
+            norms=norms.contiguous(),
+            gated_norms=gated_norms.contiguous(),
+            k_dynamic=k_dynamic,
+            v_dynamic=v_dynamic,
+            k_taps=k_taps.contiguous(),
+            v_taps=v_taps.contiguous(),
             rel_proj=w.rel_proj.T.contiguous(),
             router=bf16_router(w.router),
             experts_format=experts_format(w),
@@ -365,8 +357,8 @@ class InklingVisitMegakernel:
     without or with message gates, and each experts format of ``layers``) and the kernel-form
     arguments of ``layers``. Launches of one runner must run one at a time in stream order
     (each kind's launches share a scratch and an epoch). ``splits``: KV splits per q head of
-    (sliding, full) layers. ``trace``: compile with
-    ranges for the work items and ``trace_region``s, recorded by ``"globaltimer"`` (into
+    (sliding, full) layers. ``trace``: compile with ranges for the work items and
+    ``trace_region``s, recorded by ``"globaltimer"`` (into
     ``launches[full, messages, experts_format].trace_buffer``) or ``"iket"``."""
 
     def __init__(
