@@ -42,6 +42,7 @@ from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
 
 __all__ = ["DEFAULT_BACKEND", "check_options", "checkpoint_dir", "load_chat_model"]
 
+DEFAULT_EFFORT = "low"
 EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 PART = re.compile(
     r"(?:<\|message_model\|>)?<\|content_(thinking|text)\|>(.*?)(<\|end_message\|>|$)", re.DOTALL
@@ -150,7 +151,7 @@ class InklingChatModel:
         self.cache = InklingCache.empty(self.weights.config, options.max_len)
         self.backend = backend(self.weights, self.cache)
         self.label = f"the {options.backend} backend"
-        effort = options.reasoning_effort
+        effort = options.reasoning_effort or DEFAULT_EFFORT
         self.effort = effort if effort in EFFORTS else float(effort)
         stops = [
             self.tokenizer.eos_token_id,
@@ -190,7 +191,11 @@ def check_options(options: ChatOptions):
         raise typer.BadParameter(f"Inkling backends: {sorted(BACKENDS)}, got {options.backend!r}")
     if options.backend.startswith("megakernel") and options.max_len % 64:
         raise typer.BadParameter("--max-len must be a multiple of 64 (the megakernel's KV block)")
-    effort = options.reasoning_effort
+    qwen_only = {"--engine": options.engine, "--thinking": options.thinking}
+    qwen_only["--yarn-factor"] = options.yarn_factor
+    if given := [name for name, value in qwen_only.items() if value is not None]:
+        raise typer.BadParameter(f"Qwen-only options given for Inkling: {', '.join(given)}")
+    effort = options.reasoning_effort or DEFAULT_EFFORT
     if effort not in EFFORTS:
         try:
             valid = 0 <= float(effort) <= 0.99

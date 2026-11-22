@@ -9,9 +9,10 @@ inputs through rank-``gate_rank`` controllers.
 
 Each visit owns its caches (``InklingCache``): keys and values at
 ``(visit, kv_head, position, head_dim)``, and the inputs of its four short convolutions in rings
-of ``CONV_RING`` positions. Both are indexed by absolute position, so rewinding the
-conversation to an earlier length needs no cache surgery, and running past a stop token only
-writes rows that the next prefill overwrites.
+of ``CONV_RING`` positions. Both are indexed by absolute position. Rewinding to an earlier
+length L needs no cache surgery while the rings still hold positions L - kernel + 1 .. L - 1,
+i.e. when at most ``CONV_RING - kernel + 1`` positions past L were written: the chat's decode
+over-run past a stop token stays within that, and it rebuilds from position 0 otherwise.
 
 The numerics follow ``transformers``' ``modeling_inkling2_loop`` (branch ``add-inkling2-mini``):
 bf16 projections, fp32 block attention residuals, message gates, routing and short
@@ -832,4 +833,5 @@ def forward_tokens(
         raise ValueError(f"positions up to {pos + tokens.numel()} exceed max_len {cache.max_len}")
     positions = torch.arange(pos, pos + tokens.numel(), device=tokens.device)
     h = hidden_states(weights, tokens, positions, cache, start=pos, kernels=kernels)
-    return logits_of(weights, h if all_logits else h[-1:]).squeeze(0)
+    logits = logits_of(weights, h if all_logits else h[-1:])
+    return logits if all_logits else logits[0]

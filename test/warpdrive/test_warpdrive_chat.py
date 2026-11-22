@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from attn_gym.warpdrive.examples.chat import SYNC_EVERY, Chat
+from attn_gym.warpdrive.examples.chat import Chat
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -13,12 +13,13 @@ VOCAB, STOP = 64, 63
 
 
 class CountingBackend:
-    """Capturable: the next token is ``(pos + 1) % STOP`` until position ``stop_at``, then STOP."""
+    """Capturable: the next token is ``(pos + 1) % STOP`` until position ``stop_at``, then STOP.
+    ``stop_at`` is a device tensor, so changing it in place reaches captured graphs."""
 
     capturable = True
 
     def __init__(self, stop_at: int):
-        self.stop_at = stop_at
+        self.stop_at = torch.tensor(stop_at, device="cuda")
 
     def step(self, token, pos):
         nxt = torch.where(pos >= self.stop_at, STOP, (pos.long() + 1) % STOP)
@@ -56,11 +57,11 @@ def test_stop_incremental_prefill_and_graph_rebuild():
     # Prompt positions 0-2; the prefill samples 3, then steps feed 3, 4, ... until the stop.
     assert turn.text.split() == [str(t) for t in range(3, 13)]
     assert model.prefills == [(0, 3)]
-    assert len(turn.text.split()) + 3 < 3 + 10 + SYNC_EVERY  # stopped inside a replay
 
-    model.backend.stop_at = 30
-    chat.reply("again", None, 0.0, lambda *_: None)
+    model.backend.stop_at.fill_(20)
+    turn = chat.reply("again", None, 0.0, lambda *_: None)
     assert model.prefills[-1] == (13, 3), "same graph: only the new prompt is prefilled"
+    assert turn.text.split() == [str(t) for t in range(16, 21)]
 
     chat.reply("hot", 3, 0.5, lambda *_: None)  # a new graph: warm-up ran at positions 1-8
     assert model.prefills[-1][0] == 0, "the cached prefix must be rebuilt after warm-up"

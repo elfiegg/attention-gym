@@ -58,7 +58,9 @@ def models(tmp_path_factory):
                 param.add_(torch.randn_like(param) * 0.2)
     path = tmp_path_factory.mktemp("tiny_inkling")
     model.to(torch.bfloat16).save_pretrained(path)
-    hf = model_class.from_pretrained(path, dtype=torch.bfloat16, attn_implementation="eager")
+    hf = model_class.from_pretrained(
+        path, dtype=torch.bfloat16, attn_implementation="eager", experts_implementation="eager"
+    )
     return hf.cuda().eval(), load_inkling_weights(path)
 
 

@@ -37,7 +37,6 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 from rich.text import Text
-from tqdm.std import tqdm
 
 SYNC_EVERY = 8  # decode steps between host reads of the sampled tokens
 
@@ -87,14 +86,15 @@ class ChatModel(Protocol):
 
 @dataclass(frozen=True)
 class ChatOptions:
-    """Family-specific settings; each family reads the ones it knows."""
+    """Settings from the command line. Family-specific ones are None unless given: each family
+    applies its defaults and rejects the options of another family (``check_options``)."""
 
-    backend: str = "megakernel"
-    engine: str = "cuda_core"  # Qwen megakernel GEMV engine
+    backend: str
     max_len: int = 4096
-    thinking: bool = False  # Qwen3 thinking mode
+    engine: str | None = None  # Qwen megakernel GEMV engine
+    thinking: bool | None = None  # Qwen3 thinking mode
     yarn_factor: float | None = None  # Qwen3 YaRN
-    reasoning_effort: str = "low"  # Inkling
+    reasoning_effort: str | None = None  # Inkling
 
 
 def download(model: str, checkpoint_dir) -> Path:
@@ -104,6 +104,7 @@ def download(model: str, checkpoint_dir) -> Path:
     and one line per redraw under a rich status. ``HF_HUB_DISABLE_PROGRESS_BARS`` and
     non-terminal output hide the bar."""
     from huggingface_hub.utils import are_progress_bars_disabled
+    from tqdm.std import tqdm  # huggingface_hub's dependency, needed only to download
 
     progress = Progress(
         TextColumn(f"downloading [bold]{model}[/]"),
@@ -181,7 +182,7 @@ class Chat:
         self.graphs: dict[float, tuple] = {}  # temperature -> (graph, token in, tokens out)
 
     @torch.no_grad()
-    def prefill(self, ids: list[int]) -> torch.Tensor:
+    def prefill(self, ids: list[int]) -> tuple[torch.Tensor, int]:
         """Feed the tokens past the cached prefix; returns the last one's logits and how many
         tokens were fed."""
         if ids[: len(self.cached)] != self.cached or len(ids) == len(self.cached):
@@ -319,11 +320,12 @@ def main(
     model: str = typer.Option("Qwen/Qwen3-0.6B", help="HF repo or checkpoint directory"),
     backend: str | None = typer.Option(
         None,
-        help="decode backend; each family lists its own (Qwen: megakernel, compile; Inkling: "
-        "megakernel, megakernel-bf16, reference, torch, compile). Default: the family's "
-        "DEFAULT_BACKEND.",
+        help="decode backend of the model's family (an unknown name lists them). Default: the "
+        "family's DEFAULT_BACKEND.",
     ),
-    engine: str = typer.Option("cuda_core", help="Qwen megakernel engine: cuda_core or tcgen05"),
+    engine: str | None = typer.Option(
+        None, help="Qwen megakernel engine: cuda_core (default) or tcgen05"
+    ),
     max_len: int = typer.Option(4096, help="cache capacity (tokens)"),
     yarn_factor: float | None = typer.Option(
         None,
@@ -335,10 +337,11 @@ def main(
         None, help="cap on tokens per reply; default: until a stop token or full caches"
     ),
     temperature: float = typer.Option(0.0, help="0: greedy"),
-    thinking: bool = typer.Option(False, help="Qwen3 thinking mode"),
-    reasoning_effort: str = typer.Option(
-        "low",
-        help="Inkling thinking effort: none, minimal, low, medium, high, xhigh, max or 0-0.99",
+    thinking: bool | None = typer.Option(None, help="Qwen3 thinking mode (default off)"),
+    reasoning_effort: str | None = typer.Option(
+        None,
+        help="Inkling thinking effort: none, minimal, low (default), medium, high, xhigh, max "
+        "or 0-0.99",
     ),
     prompt: str | None = typer.Option(None, help="answer one prompt and exit"),
 ):
