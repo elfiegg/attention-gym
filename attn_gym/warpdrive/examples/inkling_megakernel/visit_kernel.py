@@ -43,7 +43,6 @@ from dataclasses import dataclass
 import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import BFloat16, Float32, Int32, Int64, cute
-from cutlass.cute.nvgpu import cpasync
 
 from attn_gym.warpdrive import (
     Consumer,
@@ -84,14 +83,14 @@ from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     RED_VALUES,
     REDUCTIONS,
     RING,
-    SMEM_BYTES,
-    SMEM_HEADROOM,
     WORDS,
     GateParams,
     InklingKernel,
     fake_gate_args,
     fetch_uniform,
     gate_atoms,
+    ring_stages,
+    tma_partition,
 )
 from attn_gym.warpdrive.examples.inkling_megakernel.mlp_half import (
     META_STAGES,
@@ -107,7 +106,6 @@ from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     COMPUTE_THREADS,
     COMPUTE_WARPS,
     HEAD_DIM,
-    MAX_STAGES,
     ROWS,
     STAGE_BYTES,
     TILE_K,
@@ -252,13 +250,8 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
             + 4 * (COMPUTE_WARPS + 1) * (HEAD_DIM + 2)
             + 4 * 4 * top_k
             + (META_STAGES * self.meta_stage_bytes if self.quantized else 0)
-            + SMEM_HEADROOM
         )
-        fit = (SMEM_BYTES - fixed) // STAGE_BYTES
-        stages = min(MAX_STAGES, fit) if stages is None else stages
-        if not 2 <= stages <= fit:
-            raise ValueError(f"stages must be in [2, {fit}], got {stages}")
-        self.stages = stages
+        self.stages = ring_stages(fixed, stages)
         self.smem_plan = SmemPlan()
         w = self.smem_plan.buffer("W", BFloat16, align=1024)
         kv = self.smem_plan.buffer("KV", BFloat16, align=1024, overlaps=w)
@@ -279,7 +272,7 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
                 meta["P"] = self.smem_plan.buffer("P", Int32, align=128)
         # Compute reads stages with generic loads before TMA refills them; the layer emits the
         # fence.proxy.async on a Warps release of a Tma-filled ring.
-        self.w = Ring(stages, Tma(STAGE_BYTES), Warps, buffer=stage_buffers)
+        self.w = Ring(self.stages, Tma(STAGE_BYTES), Warps, buffer=stage_buffers)
         if self.quantized:
             self.meta = Ring(META_STAGES, Tma(self.meta_stage_bytes), Warps, buffer=meta)
         self.csync = NamedBarrier(threads=COMPUTE_THREADS)
@@ -465,15 +458,9 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
 
     @cute.kernel
     def kernel(self, tma, gtensors, gate_tma, gate_g, scratch, tensors, blocks, bound, flags):
-        layouts = {
-            "W": cute.make_layout((ROWS, TILE_K, self.stages), stride=(TILE_K, 1, ROWS * TILE_K)),
+        layouts = self.core_layouts(self.x_rows) | {
             "KV": cute.make_layout(
                 (BLOCK, HEAD_DIM, self.stages), stride=(HEAD_DIM, 1, BLOCK * HEAD_DIM)
-            ),
-            "X": cute.make_layout((self.x_rows, self.hidden), stride=(self.hidden, 1)),
-            "RED": cute.make_layout(
-                (REDUCTIONS, COMPUTE_WARPS, RED_VALUES),
-                stride=(COMPUTE_WARPS * RED_VALUES, RED_VALUES, 1),
             ),
             "MIX": cute.make_layout((MIX_FLOATS,)),
             "QKVS": cute.make_layout((QKVS_FLOATS,)),
@@ -510,15 +497,7 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
         targets += self.mlp_targets()
         parts, views = [], {}
         for atom, g, (name, box) in zip(tma, gtensors, targets):
-            rank = len(box)
-            tiles = cute.local_tile(g, box, (None,) * rank)
-            part = cpasync.tma_partition(
-                atom,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(self.buffer(name), 0, rank),
-                cute.group_modes(tiles, 0, rank),
-            )
+            part = tma_partition(atom, self.buffer(name), g, box)
             parts.append(part)
             views.setdefault(name, StageView(part[0], axis=1))
         gate = self.gate_params(self.buffer("W"), gate_tma, gate_g, tagged, tensors)

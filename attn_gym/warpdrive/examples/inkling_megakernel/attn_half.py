@@ -44,7 +44,6 @@ import math
 
 import cutlass
 from cutlass import BFloat16, Float32, Int32, cute
-from cutlass.cute.nvgpu import cpasync
 
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     MAX_BLOCKS,
@@ -53,6 +52,7 @@ from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     fp32,
     fp32_reciprocal,
     load_tiles,
+    tma_atom,
 )
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     BLOCK,
@@ -768,15 +768,7 @@ class AttentionHalf:
         """TMA ``(atom, tensor)`` pairs: 32 x 256 weight tiles of the projection matrices in
         ``matrices`` order (sliding layers have no dynamic taps) and of wo, then 64 x 128 KV
         blocks of the caches."""
-        op = cpasync.CopyBulkTensorTileG2SOp()
-        w_smem = cute.make_layout((ROWS, TILE_K), stride=(TILE_K, 1))
-        kv_smem = cute.make_layout((BLOCK, HEAD_DIM), stride=(HEAD_DIM, 1))
-        weights = [
-            cpasync.make_tiled_tma_atom(op, src, w_smem, (ROWS, TILE_K))
-            for src in [by_matrix[m] for m in self.matrices] + [wo]
-        ]
-        caches = [
-            cpasync.make_tiled_tma_atom(op, src, kv_smem, (BLOCK, HEAD_DIM))
-            for src in (k_cache, v_cache)
-        ]
+        sources = [by_matrix[m] for m in self.matrices] + [wo]
+        weights = [tma_atom(src, (ROWS, TILE_K)) for src in sources]
+        caches = [tma_atom(src, (BLOCK, HEAD_DIM)) for src in (k_cache, v_cache)]
         return weights, caches

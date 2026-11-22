@@ -1,6 +1,7 @@
 """Device code shared by the Inkling 2 Mini megakernel launches (``visit_kernel`` with its
 halves ``attn_half`` and ``mlp_half``, ``msg_kernel``, ``head_kernel``): sizes, tagged-word
-polling, CTA reductions, the block-residual prologue and the message-gate work items.
+polling, CTA reductions, TMA plumbing, the block-residual prologue and the message-gate work
+items, and the launches whose items are row tiles of one matrix (``MatrixRowsKernel``).
 
 Message gates (core passes after the first, ``ref.message_gate``) run inside the visit launch
 as two kinds of work items before the rows of the half whose input they gate (gates 0-2: the
@@ -22,6 +23,7 @@ On GB300 at Inkling 2 Mini's shapes the gather of a sliding attention half ends 
 the prologue (whole-K MSGDOWN tiles and 32-row GATEMIX items, two on some CTAs: ~9 us).
 """
 
+import math
 import struct
 from dataclasses import dataclass
 
@@ -31,15 +33,31 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import dsl_user_op
 
-from attn_gym.warpdrive import WarpSpecialized
+from attn_gym.warpdrive import (
+    NamedBarrier,
+    Ring,
+    SmemPlan,
+    StageView,
+    StaticPersistent,
+    Tma,
+    Warps,
+    WarpSpecialized,
+    WorkStream,
+)
 from attn_gym.warpdrive.cache import make_fake_compact_tensor
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     COMPUTE_THREADS,
     COMPUTE_WARPS,
     EVICT_FIRST,
+    MAX_STAGES,
     ROWS,
     ROWS_PER_WARP,
+    SMEM_BYTES,
+    SMEM_HEADROOM,
+    STAGE_BYTES,
     TILE_K,
+    CudaCoreGemv,
+    InstructionTable,
     bf16_round,
     group_sum,
     load_words,
@@ -51,8 +69,6 @@ WORDS = 4  # table words: op, a, b, table row
 MAX_BLOCKS = 4  # completed blocks of a block residual; the partial block is the fifth state
 STATES = MAX_BLOCKS + 1
 RING = 16  # ref.CONV_RING: positions of the convolution input rings
-SMEM_BYTES = 232448  # SM100 per-block shared memory (227 KB)
-SMEM_HEADROOM = 1024
 REDUCTIONS = 3  # CTA reduction slots: state norms, query dots, the inputs' norms
 RED_VALUES = 16  # values per CTA reduction
 MSGDOWN, GATEMIX = 6, 7  # message-gate ops, after the visit's own ops 0-5
@@ -77,6 +93,16 @@ def fp32_reciprocal(x: float) -> float:
     """``1 / x`` in fp32: PyTorch divides a CUDA tensor by a Python scalar as a multiplication by
     this reciprocal."""
     return fp32(1.0 / fp32(x))
+
+
+def ring_stages(fixed: int, stages: int | None) -> int:
+    """Depth of a weight ring of ``STAGE_BYTES`` stages beside ``fixed`` bytes of other shared
+    memory: ``stages``, by default as many as fit up to ``MAX_STAGES``."""
+    fit = (SMEM_BYTES - fixed - SMEM_HEADROOM) // STAGE_BYTES
+    stages = min(MAX_STAGES, fit) if stages is None else stages
+    if not 2 <= stages <= fit:
+        raise ValueError(f"stages must be in [2, {fit}], got {stages}")
+    return stages
 
 
 def scratch_offsets(shapes: dict[str, int]) -> tuple[dict[str, int], int]:
@@ -146,6 +172,27 @@ def load_tiles(w, atom, tiles, row, k0, count: cutlass.Constexpr, buffer: cutlas
     return w
 
 
+def tma_atom(src, box: tuple[int, ...]) -> tuple:
+    """TMA ``(atom, tensor)`` loading ``box`` tiles of ``src`` into row-major SMEM."""
+    stride = tuple(math.prod(box[i + 1 :]) for i in range(len(box)))
+    smem = cute.make_layout(box, stride=stride)
+    return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), src, smem, box)
+
+
+def tma_partition(atom, smem, gtensor, box: tuple[int, ...]) -> tuple:
+    """TMA ``atom``'s ``(SMEM, GMEM)`` partitions: the stages of ``smem`` (box modes first),
+    and ``gtensor``'s ``box`` tiles, ``(TMA, tile coordinates...)``."""
+    rank = len(box)
+    tiles = cute.local_tile(gtensor, box, (None,) * rank)
+    return cpasync.tma_partition(
+        atom,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(smem, 0, rank),
+        cute.group_modes(tiles, 0, rank),
+    )
+
+
 def fake_gate_args(hidden: int) -> tuple:
     """Fake compile arguments of a core layer's message gates (``gate_atoms``, ``GateParams``):
     the down projections ``(GATES * GATE_RANK, 2 * hidden)`` bf16, the fp32 ``(GATES, hidden,
@@ -162,12 +209,10 @@ def fake_gate_args(hidden: int) -> tuple:
 def gate_atoms(down, fg, hidden: int) -> list:
     """TMA ``(atom, tensor)`` pairs of 32 x 256 bf16 tiles of the down projections' x halves
     (their first ``hidden`` columns) and of the ``[F | G]`` rows (one tile: 32 rows)."""
-    op = cpasync.CopyBulkTensorTileG2SOp()
-    smem = cute.make_layout((ROWS, TILE_K), stride=(TILE_K, 1))
     x_half = cute.make_tensor(
         down.iterator, cute.make_layout((GATES * GATE_RANK, hidden), stride=(2 * hidden, 1))
     )
-    return [cpasync.make_tiled_tma_atom(op, src, smem, (ROWS, TILE_K)) for src in (x_half, fg)]
+    return [tma_atom(src, (ROWS, TILE_K)) for src in (x_half, fg)]
 
 
 @dataclass(frozen=True)
@@ -212,6 +257,18 @@ class InklingKernel(WarpSpecialized):
         if len(gate_query) != GATES:
             raise ValueError(f"need a prologue query for each of the {GATES} gates")
         self.messages, self.gate_query = messages, gate_query
+
+    def core_layouts(self, x_rows: int) -> dict:
+        """SMEM layouts of the weight stages ``W``, the GEMV inputs ``X`` (``x_rows`` rows) and
+        the reductions ``RED``."""
+        return {
+            "W": cute.make_layout((ROWS, TILE_K, self.stages), stride=(TILE_K, 1, ROWS * TILE_K)),
+            "X": cute.make_layout((x_rows, self.hidden), stride=(self.hidden, 1)),
+            "RED": cute.make_layout(
+                (REDUCTIONS, COMPUTE_WARPS, RED_VALUES),
+                stride=(COMPUTE_WARPS * RED_VALUES, RED_VALUES, 1),
+            ),
+        }
 
     @property
     def scratch_shapes(self) -> dict[str, int]:
@@ -424,16 +481,7 @@ class InklingKernel(WarpSpecialized):
         ``mhalf``/``messages`` argument tensors."""
         if cutlass.const_expr(not self.messages):
             return None
-        parts = [
-            cpasync.tma_partition(
-                atom,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(sW, 0, 2),
-                cute.group_modes(cute.local_tile(g, (ROWS, TILE_K), (None, None)), 0, 2),
-            )
-            for atom, g in zip(tma, gtensors)
-        ]
+        parts = [tma_partition(atom, sW, g, (ROWS, TILE_K)) for atom, g in zip(tma, gtensors)]
         return GateParams(
             tma=tuple(tma),
             gmem=tuple(part[1] for part in parts),
@@ -552,3 +600,51 @@ class InklingKernel(WarpSpecialized):
                 k = r * COMPUTE_THREADS + tid
                 p.xs[s, k] = BFloat16(Float32(weights[s, r]) * (vals[s * per + r] * rinv))
         self.csync.sync()
+
+
+class MatrixRowsKernel(InklingKernel):
+    """A launch whose items are 32-row tiles (table word ``a``) of one bf16 ``(rows, hidden)``
+    matrix against the GEMV input ``xs[0]``: ``msg_kernel`` and ``head_kernel``. Items depend
+    on nothing outside the CTA, so the load warp streams every item's stages at once
+    (``load_matrix_rows``). Their params carry ``tma``/``gmem`` (the matrix's atom and tile
+    partition), ``sW``, ``xs`` (``(1, hidden)``) and ``red`` (``matrix_params``)."""
+
+    def init_matrix_rows(self, hidden: int, rms_eps: float, stages: int | None):
+        """``stages``: weight ring depth in 16 KB stages."""
+        if hidden % COMPUTE_THREADS or hidden % TILE_K:
+            raise ValueError(f"hidden size must be a multiple of {COMPUTE_THREADS} and {TILE_K}")
+        self.hidden, self.rms_eps = hidden, rms_eps
+        self.hidden_k_tiles = hidden // TILE_K
+        self.stages = ring_stages(2 * hidden + 4 * REDUCTIONS * COMPUTE_WARPS * RED_VALUES, stages)
+        self.smem_plan = SmemPlan()
+        w = self.smem_plan.buffer("W", BFloat16, align=1024)
+        self.smem_plan.buffer("X", BFloat16, align=16)
+        self.smem_plan.buffer("RED", Float32, align=16)
+        # Compute reads stages with generic loads before TMA refills them; the layer emits the
+        # fence.proxy.async on a Warps release of a Tma-filled ring.
+        self.w = Ring(self.stages, Tma(STAGE_BYTES), Warps, buffer={"W": w})
+        self.csync = NamedBarrier(threads=COMPUTE_THREADS)
+        self.engine = CudaCoreGemv()
+        self.work = WorkStream(mapping=InstructionTable(words=WORDS), schedule=StaticPersistent())
+
+    @cute.jit
+    def load_matrix_rows(self, p, w, work):
+        """The load role: every item's weight stages."""
+        w = w.views(W=p.sW)
+        while work.valid:
+            _op, tile, _b, _row = work.item
+            w = load_tiles(w, p.tma[0], p.gmem[0], tile, 0, self.hidden_k_tiles, "W")
+            work.advance()
+        return w, work
+
+    def matrix_params(self, atom, gtensor) -> dict:
+        """The params fields of the matrix (TMA ``atom`` over ``gtensor``) and the SMEM
+        buffers, after ``begin_roles(layouts=self.core_layouts(1))``."""
+        smem, gmem = tma_partition(atom, self.buffer("W"), gtensor, (ROWS, TILE_K))
+        return {
+            "tma": (atom,),
+            "gmem": (gmem,),
+            "sW": StageView(smem, axis=1),
+            "xs": self.buffer("X"),
+            "red": self.buffer("RED"),
+        }

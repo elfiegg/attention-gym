@@ -15,7 +15,8 @@ of each message gate's down projection that reads it (``ref.message_gate``'s ``h
 
 The visit launches of the pass read ``messages`` and ``mhalf`` (``common``'s GATEMIX). Items
 depend on nothing but the prologue: no tagged words, no epoch. Roles as ``visit_kernel``:
-warp 8 ``load`` streams 32 x 256 weight stages, warps 0-7 ``compute`` run ``CudaCoreGemv``.
+warp 8 ``load`` streams 32 x 256 weight stages, warps 0-7 ``compute`` run ``CudaCoreGemv``
+(``common.MatrixRowsKernel``).
 """
 
 from dataclasses import dataclass
@@ -23,46 +24,23 @@ from dataclasses import dataclass
 import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import BFloat16, Float32, Int32, cute
-from cutlass.cute.nvgpu import cpasync
 
-from attn_gym.warpdrive import (
-    Consumer,
-    Local,
-    NamedBarrier,
-    Producer,
-    Ring,
-    SmemPlan,
-    StageView,
-    StaticPersistent,
-    Tma,
-    Warps,
-    WorkCursor,
-    WorkStream,
-    role,
-)
+from attn_gym.warpdrive import Consumer, Local, Producer, StageView, WorkCursor, role
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     GATE_RANK,
     GATE_TILES,
-    RED_VALUES,
-    REDUCTIONS,
-    SMEM_BYTES,
-    SMEM_HEADROOM,
     WORDS,
-    InklingKernel,
+    MatrixRowsKernel,
     fp32,
     fp32_reciprocal,
-    load_tiles,
+    tma_atom,
 )
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     COMPUTE_THREADS,
     COMPUTE_WARPS,
-    MAX_STAGES,
     ROWS,
-    STAGE_BYTES,
     TILE_K,
-    CudaCoreGemv,
-    InstructionTable,
 )
 
 MSG = 0
@@ -82,32 +60,13 @@ class MsgParams:
     mhalf: cute.Tensor  # (messages * GATE_RANK,) fp32 output
 
 
-class InklingMsgKernel(InklingKernel):
+class InklingMsgKernel(MatrixRowsKernel):
     """One core pass's messages and message halves (see the module docstring). Constructor
     arguments are the hidden size and the gates' RMSNorm epsilon; ``stages``: weight ring depth
     in 16 KB stages."""
 
     def __init__(self, hidden: int, rms_eps: float, stages: int | None = None):
-        if hidden % COMPUTE_THREADS or hidden % TILE_K:
-            raise ValueError(f"hidden size must be a multiple of {COMPUTE_THREADS} and {TILE_K}")
-        self.hidden, self.rms_eps = hidden, rms_eps
-        self.hidden_k_tiles = hidden // TILE_K
-        fixed = 2 * hidden + 4 * REDUCTIONS * COMPUTE_WARPS * RED_VALUES + SMEM_HEADROOM
-        fit = (SMEM_BYTES - fixed) // STAGE_BYTES
-        stages = min(MAX_STAGES, fit) if stages is None else stages
-        if not 2 <= stages <= fit:
-            raise ValueError(f"stages must be in [2, {fit}], got {stages}")
-        self.stages = stages
-        self.smem_plan = SmemPlan()
-        w = self.smem_plan.buffer("W", BFloat16, align=1024)
-        self.smem_plan.buffer("X", BFloat16, align=16)
-        self.smem_plan.buffer("RED", Float32, align=16)
-        # Compute reads stages with generic loads before TMA refills them; the layer emits the
-        # fence.proxy.async on a Warps release of a Tma-filled ring.
-        self.w = Ring(stages, Tma(STAGE_BYTES), Warps, buffer={"W": w})
-        self.csync = NamedBarrier(threads=COMPUTE_THREADS)
-        self.engine = CudaCoreGemv()
-        self.work = WorkStream(mapping=InstructionTable(words=WORDS), schedule=StaticPersistent())
+        self.init_matrix_rows(hidden, rms_eps, stages)
 
     def get_name(self) -> str:
         return f"warpdrive_inkling_msg_h{self.hidden}_s{self.stages}{self.trace_key()}"
@@ -115,12 +74,7 @@ class InklingMsgKernel(InklingKernel):
     @role(warps=COMPUTE_WARPS)
     @cute.jit
     def load(self, p: MsgParams, *, w: Producer, work: WorkCursor):
-        w = w.views(W=p.sW)
-        while work.valid:
-            _op, tile, _b, _row = work.item
-            w = load_tiles(w, p.tma[0], p.gmem[0], tile, 0, self.hidden_k_tiles, "W")
-            work.advance()
-        return w, work
+        return self.load_matrix_rows(p, w, work)
 
     @role(warps=range(COMPUTE_WARPS))
     @cute.jit
@@ -184,31 +138,14 @@ class InklingMsgKernel(InklingKernel):
 
     @cute.kernel
     def kernel(self, tma, gtensor, tensors, bound):
-        layouts = {
-            "W": cute.make_layout((ROWS, TILE_K, self.stages), stride=(TILE_K, 1, ROWS * TILE_K)),
-            "X": cute.make_layout((1, self.hidden), stride=(self.hidden, 1)),
-            "RED": cute.make_layout(
-                (REDUCTIONS, COMPUTE_WARPS, RED_VALUES),
-                stride=(COMPUTE_WARPS * RED_VALUES, RED_VALUES, 1),
-            ),
-        }
-        self.begin_roles(work=bound, layouts=layouts)
+        self.begin_roles(work=bound, layouts=self.core_layouts(1))
         # Materialize the argument tensors in converged code: a first use inside one role's
         # branch would not dominate the other roles' uses.
         block, partial, queries, messages, mhalf = (
             cute.make_tensor(t.iterator, t.layout) for t in tensors
         )
-        sW = self.buffer("W")
-        tiles = cute.local_tile(gtensor, (ROWS, TILE_K), (None, None))
-        part = cpasync.tma_partition(
-            tma, 0, cute.make_layout(1), cute.group_modes(sW, 0, 2), cute.group_modes(tiles, 0, 2)
-        )
         params = MsgParams(
-            tma=(tma,),
-            gmem=(part[1],),
-            sW=StageView(part[0], axis=1),
-            xs=self.buffer("X"),
-            red=self.buffer("RED"),
+            **self.matrix_params(tma, gtensor),
             block=block,
             partial=partial,
             queries=queries,
@@ -237,10 +174,7 @@ class InklingMsgKernel(InklingKernel):
         halves = cute.make_tensor(
             down.iterator + h, cute.make_layout((rows, h), stride=(2 * h, 1))
         )
-        smem = cute.make_layout((ROWS, TILE_K), stride=(TILE_K, 1))
-        atom, gtensor = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(), halves, smem, (ROWS, TILE_K)
-        )
+        atom, gtensor = tma_atom(halves, (ROWS, TILE_K))
         bound = self.work.bind(table, workspace, max_ctas)
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(atom, gtensor, (block, partial, queries, messages, mhalf), bound).launch(
